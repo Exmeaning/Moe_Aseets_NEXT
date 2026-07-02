@@ -37,7 +37,8 @@ type CheckDecision struct {
 	SharedReuse bool
 }
 
-// CheckPath applies §7.3 logic for one (server, path, fingerprint) triple.
+// CheckPath applies §7.3 logic for one canonical public asset path
+// (server, bundle_path/asset_path, fingerprint) triple.
 func CheckPath(ctx context.Context, db *sql.DB, server, path, fingerprint string) (CheckDecision, error) {
 	// 1) same server already has same (path, fingerprint) → SKIP.
 	var one int
@@ -50,7 +51,7 @@ func CheckPath(ctx context.Context, db *sql.DB, server, path, fingerprint string
 		return CheckDecision{}, err
 	}
 
-	// 2) look up newest shared baseline for this path.
+	// 2) look up newest shared baseline for this canonical asset path.
 	var sharedFp, sharedKey string
 	err = db.QueryRowContext(ctx, `SELECT fingerprint, storage_key FROM assets
 		WHERE path=? AND is_override=0 ORDER BY id DESC LIMIT 1`, path).Scan(&sharedFp, &sharedKey)
@@ -64,6 +65,39 @@ func CheckPath(ctx context.Context, db *sql.DB, server, path, fingerprint string
 		// Cross-region shared reuse: SKIP, but COMMIT should mint a new row
 		// for (server, path, version) pointing at the existing shared key.
 		return CheckDecision{Skip: true, SharedReuse: true, SharedStorageKey: sharedKey}, nil
+	}
+	return CheckDecision{Placement: "OVERRIDE"}, nil
+}
+
+// CheckBundle applies the pre-download HIP CHECK semantics. The updater sends
+// bundle_path here (before it has exported per-file asset paths), so this must
+// inspect bundle_path + fingerprint, not the canonical per-file public path.
+func CheckBundle(ctx context.Context, db *sql.DB, server, bundlePath, fingerprint string) (CheckDecision, error) {
+	// Same server already committed this bundle fingerprint: no need to download
+	// and export it again.
+	var one int
+	err := db.QueryRowContext(ctx, `SELECT 1 FROM assets WHERE server=? AND bundle_path=? AND fingerprint=? LIMIT 1`,
+		server, bundlePath, fingerprint).Scan(&one)
+	if err == nil {
+		return CheckDecision{Skip: true}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return CheckDecision{}, err
+	}
+
+	// If a shared baseline for this exact bundle fingerprint exists, any region
+	// can read it through the shared index without region-specific rows.
+	var sharedFp string
+	err = db.QueryRowContext(ctx, `SELECT fingerprint FROM assets
+		WHERE bundle_path=? AND is_override=0 ORDER BY id DESC LIMIT 1`, bundlePath).Scan(&sharedFp)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CheckDecision{Placement: "SHARED"}, nil
+	}
+	if err != nil {
+		return CheckDecision{}, err
+	}
+	if sharedFp == fingerprint {
+		return CheckDecision{Skip: true}, nil
 	}
 	return CheckDecision{Placement: "OVERRIDE"}, nil
 }

@@ -5,8 +5,9 @@
 //   - a mini HIP client that walks HELLO → CHECK → UPLOAD → COMMIT
 //
 // It verifies:
-//   - CHECK returns SHARED for a fresh (server, path)
-//   - UPLOAD_ACK OK, and a subsequent read via /sekai-{server}-assets/{path}
+//   - CHECK treats path as bundle_path (the updater has not exported files yet)
+//   - UPLOAD stores bundle_path + asset_path as the public path, and a
+//     subsequent read via /sekai-{server}-assets/{bundle_path}/{asset_path}
 //     serves the exact bytes with X-Serve-From=shared
 //   - A same-path different-fp upload from another region gets OVERRIDE and
 //     is served with X-Serve-From=override
@@ -291,7 +292,7 @@ func runSession(t *testing.T, fx *fixture, region, appVersion, assetVersion, ass
 	batch := hipproto.CheckBatch{BatchID: 1}
 	for _, it := range items {
 		batch.Items = append(batch.Items, hipproto.CheckBatchItem{
-			Path:        it.path,
+			Path:        it.bundlePath,
 			Fingerprint: it.fingerprint,
 			Size:        uint64(len(it.body)),
 			Provider:    region,
@@ -394,11 +395,15 @@ func TestEndToEndSharedThenOverride(t *testing.T) {
 	body1 := []byte("hello jp world " + strings.Repeat("x", 1024))
 	body2 := []byte("EN OVERRIDE variant " + strings.Repeat("y", 512))
 
+	const bundlePath = "character/member_small/res026_no048"
+	const assetPath = "card_normal.webp"
+	const publicPath = bundlePath + "/" + assetPath
+
 	// JP session: uploads a fresh shared asset.
 	runSession(t, fx, "jp", "6.0.0", "6.0.0.1", "hash-jp-1", []uploadItem{
 		{
-			path:             "event/foo/bg.webp",
-			bundlePath:       "bundle/event_foo",
+			path:             assetPath,
+			bundlePath:       bundlePath,
 			fingerprint:      "111",
 			body:             body1,
 			wantAction:       hipproto.ActionUpload,
@@ -407,8 +412,8 @@ func TestEndToEndSharedThenOverride(t *testing.T) {
 		},
 	})
 
-	// Read from JP.
-	respBody, headers := httpGet(t, fx.httpBase+"/sekai-jp-assets/event/foo/bg.webp")
+	// Read from JP using the real public path: bundle_path + asset_path.
+	respBody, headers := httpGet(t, fx.httpBase+"/sekai-jp-assets/"+publicPath)
 	if !bytes.Equal(respBody, body1) {
 		t.Fatalf("body mismatch, got %d bytes want %d", len(respBody), len(body1))
 	}
@@ -419,18 +424,18 @@ func TestEndToEndSharedThenOverride(t *testing.T) {
 		t.Fatalf("ETag=%q", headers.Get("ETag"))
 	}
 
-	// Cross-region SKIP+reuse: EN uploads same fp → should get SKIP.
+	// Cross-region SKIP+reuse: EN checks same bundle fp → should get SKIP.
 	runSession(t, fx, "en", "6.0.0", "6.0.0.1", "hash-en-1", []uploadItem{
 		{
-			path:        "event/foo/bg.webp",
-			bundlePath:  "bundle/event_foo",
+			path:        assetPath,
+			bundlePath:  bundlePath,
 			fingerprint: "111",
 			body:        body1,
 			wantAction:  hipproto.ActionSkip,
 		},
 	})
 	// EN read must still succeed and serve the shared bytes.
-	respBody, headers = httpGet(t, fx.httpBase+"/sekai-en-assets/event/foo/bg.webp")
+	respBody, headers = httpGet(t, fx.httpBase+"/sekai-en-assets/"+publicPath)
 	if !bytes.Equal(respBody, body1) {
 		t.Fatalf("en shared reuse body mismatch")
 	}
@@ -438,11 +443,11 @@ func TestEndToEndSharedThenOverride(t *testing.T) {
 		t.Fatalf("en shared reuse serve-from=%q", headers.Get("X-Serve-From"))
 	}
 
-	// EN OVERRIDE: same path, different fp.
+	// EN OVERRIDE: same public path, different fp.
 	runSession(t, fx, "en", "6.0.0", "6.0.0.2", "hash-en-2", []uploadItem{
 		{
-			path:             "event/foo/bg.webp",
-			bundlePath:       "bundle/event_foo",
+			path:             assetPath,
+			bundlePath:       bundlePath,
 			fingerprint:      "222",
 			body:             body2,
 			wantAction:       hipproto.ActionUpload,
@@ -451,7 +456,7 @@ func TestEndToEndSharedThenOverride(t *testing.T) {
 		},
 	})
 
-	respBody, headers = httpGet(t, fx.httpBase+"/sekai-en-assets/event/foo/bg.webp")
+	respBody, headers = httpGet(t, fx.httpBase+"/sekai-en-assets/"+publicPath)
 	if !bytes.Equal(respBody, body2) {
 		t.Fatalf("en override body mismatch")
 	}
@@ -463,9 +468,16 @@ func TestEndToEndSharedThenOverride(t *testing.T) {
 	}
 
 	// JP path must remain shared (unchanged).
-	_, headers = httpGet(t, fx.httpBase+"/sekai-jp-assets/event/foo/bg.webp")
+	_, headers = httpGet(t, fx.httpBase+"/sekai-jp-assets/"+publicPath)
 	if headers.Get("X-Serve-From") != "shared" {
 		t.Fatalf("jp after en override serve-from=%q", headers.Get("X-Serve-From"))
+	}
+
+	// Regression guard for the production bug: the asset must not be indexed or
+	// stored under the bare asset filename.
+	code, missHeaders := httpGetCode(t, fx.httpBase+"/sekai-jp-assets/"+assetPath)
+	if code != 404 || missHeaders.Get("X-Miss") != "not-indexed" {
+		t.Fatalf("bare asset path should miss, got code=%d X-Miss=%q", code, missHeaders.Get("X-Miss"))
 	}
 }
 
@@ -489,7 +501,7 @@ func TestShaMismatchRejected(t *testing.T) {
 	// A GET should 404 because the corrupt upload was rejected before COMMIT
 	// mutated the assets table. But COMMIT still ran for zero good rows —
 	// which is legal (no assets to commit); index has no entry.
-	code, _ := httpGetCode(t, fx.httpBase+"/sekai-jp-assets/test/corrupt.bin")
+	code, _ := httpGetCode(t, fx.httpBase+"/sekai-jp-assets/bundle/corrupt/test/corrupt.bin")
 	if code != 404 {
 		t.Fatalf("expected 404 after corrupt, got %d", code)
 	}

@@ -81,6 +81,32 @@ func TestCheckPathOverride(t *testing.T) {
 	}
 }
 
+func TestCheckBundleUsesBundlePath(t *testing.T) {
+	db := openMem(t)
+	insert(t, db, Asset{
+		Server: "jp", BundlePath: "character/member_small/res026_no048",
+		Path: "character/member_small/res026_no048/card_normal.webp", Version: "v1",
+		Fingerprint: "111", Sha256: "x", IsOverride: false,
+		StorageKey: "/shared-assets/character/member_small/res026_no048/card_normal.webp",
+	})
+
+	d, err := CheckBundle(context.Background(), db, "en", "character/member_small/res026_no048", "111")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Skip {
+		t.Fatalf("same shared bundle fingerprint should skip: %+v", d)
+	}
+
+	d, err = CheckBundle(context.Background(), db, "en", "character/member_small/res026_no048", "222")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Skip || d.Placement != "OVERRIDE" {
+		t.Fatalf("changed bundle should upload as override: %+v", d)
+	}
+}
+
 func TestInsertAssetUpsert(t *testing.T) {
 	db := openMem(t)
 	insert(t, db, Asset{Server: "jp", Path: "p", Version: "v1", Fingerprint: "1", Sha256: "a", Size: 10, StorageKey: "/k1"})

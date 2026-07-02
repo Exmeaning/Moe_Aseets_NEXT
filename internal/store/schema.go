@@ -16,9 +16,10 @@ CREATE TABLE IF NOT EXISTS assets (
     created_at    INTEGER NOT NULL,
     UNIQUE(server, path, version)
 );
-CREATE INDEX IF NOT EXISTS idx_assets_path_fp  ON assets(path, fingerprint);
-CREATE INDEX IF NOT EXISTS idx_assets_sha      ON assets(sha256);
-CREATE INDEX IF NOT EXISTS idx_assets_current  ON assets(server, path);
+CREATE INDEX IF NOT EXISTS idx_assets_path_fp   ON assets(path, fingerprint);
+CREATE INDEX IF NOT EXISTS idx_assets_bundle_fp ON assets(bundle_path, fingerprint);
+CREATE INDEX IF NOT EXISTS idx_assets_sha       ON assets(sha256);
+CREATE INDEX IF NOT EXISTS idx_assets_current   ON assets(server, path);
 
 CREATE TABLE IF NOT EXISTS versions (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -337,26 +337,19 @@ func (s *session) handleCheckBatch(ctx context.Context, payload []byte) error {
 	}
 	result := hipproto.CheckResult{BatchID: batch.BatchID, Results: make([]hipproto.CheckAckItem, 0, len(batch.Items))}
 	for _, item := range batch.Items {
-		d, err := store.CheckPath(ctx, s.srv.db, s.hello.Region, item.Path, item.Fingerprint)
+		bundlePath := safeStripInvisible(item.Path)
+		if _, err := storage.SafeRelPath(bundlePath); err != nil {
+			return s.sendFatal(ctx, hipproto.ErrCodeProtoViolation, "unsafe bundle path")
+		}
+		d, err := store.CheckBundle(ctx, s.srv.db, s.hello.Region, bundlePath, item.Fingerprint)
 		if err != nil {
-			s.log.Warn("hip: CHECK query failed", "err", err, "path", item.Path)
+			s.log.Warn("hip: CHECK query failed", "err", err, "bundle_path", bundlePath)
 			return s.sendFatal(ctx, hipproto.ErrCodeInternal, "check failed")
 		}
 		var ack hipproto.CheckAckItem
-		ack.Path = item.Path
+		ack.Path = bundlePath
 		if d.Skip {
 			ack.Action = hipproto.ActionSkip
-			if d.SharedReuse {
-				key := crossRegionReuseKey(item.Path, item.Fingerprint)
-				s.pendingMu.Lock()
-				s.sharedReuse[key] = sharedReuseEntry{
-					server:      s.hello.Region,
-					path:        item.Path,
-					fingerprint: item.Fingerprint,
-					storageKey:  d.SharedStorageKey,
-				}
-				s.pendingMu.Unlock()
-			}
 		} else {
 			ack.Action = hipproto.ActionUpload
 			ack.Placement = d.Placement
@@ -370,6 +363,18 @@ func crossRegionReuseKey(path, fingerprint string) string {
 	return path + "\x00" + fingerprint
 }
 
+func canonicalAssetPath(bundlePath, assetPath string) (string, error) {
+	bundlePath = safeStripInvisible(bundlePath)
+	assetPath = safeStripInvisible(assetPath)
+	if _, err := storage.SafeRelPath(bundlePath); err != nil {
+		return "", err
+	}
+	if _, err := storage.SafeRelPath(assetPath); err != nil {
+		return "", err
+	}
+	return bundlePath + "/" + assetPath, nil
+}
+
 // ------------- UPLOAD -------------
 
 func (s *session) handleUploadBegin(ctx context.Context, payload []byte) error {
@@ -377,7 +382,8 @@ func (s *session) handleUploadBegin(ctx context.Context, payload []byte) error {
 	if err := hipproto.Decode(payload, &begin); err != nil {
 		return s.sendFatal(ctx, hipproto.ErrCodeProtoViolation, "bad UPLOAD_BEGIN payload")
 	}
-	if _, err := storage.SafeRelPath(begin.Path); err != nil {
+	canonicalPath, err := canonicalAssetPath(begin.BundlePath, begin.Path)
+	if err != nil {
 		return s.sendFatal(ctx, hipproto.ErrCodeProtoViolation, "unsafe path")
 	}
 	// Acquire an in-flight slot. Blocks; the client should have obeyed
@@ -395,7 +401,7 @@ func (s *session) handleUploadBegin(ctx context.Context, payload []byte) error {
 		return s.sendFatal(ctx, hipproto.ErrCodeProtoViolation, "duplicate stream_id")
 	}
 	// Re-derive placement from the DB to avoid trusting client memory.
-	dec, err := store.CheckPath(ctx, s.srv.db, s.hello.Region, begin.Path, begin.Fingerprint)
+	dec, err := store.CheckPath(ctx, s.srv.db, s.hello.Region, canonicalPath, begin.Fingerprint)
 	if err != nil {
 		s.uploadsMu.Unlock()
 		<-s.uploadSem
@@ -409,7 +415,7 @@ func (s *session) handleUploadBegin(ctx context.Context, payload []byte) error {
 		return s.send(ctx, hipproto.FrameUploadAck, ackErr(begin.StreamID, hipproto.UploadStatusRejected, "already present"))
 	}
 	temp := storage.TempKey(s.hello.RunID, begin.StreamID)
-	up := newInflight(ctx, s.srv.storage, begin, temp)
+	up := newInflight(ctx, s.srv.storage, begin, canonicalPath, temp)
 	up.placement = dec.Placement
 	s.uploads[begin.StreamID] = up
 	s.uploadsMu.Unlock()

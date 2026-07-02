@@ -45,13 +45,13 @@ type inflightUpload struct {
 
 // newInflight builds an inflight upload and kicks off the concurrent PUT
 // to the SeaweedFS filer. Chunks arrive via pipeW.Write() from the reader
-// goroutine.
-func newInflight(ctx context.Context, sc *storage.Client, begin hipproto.UploadBegin, tempKey string) *inflightUpload {
+// goroutine. path is the canonical public path: bundle_path + "/" + asset path.
+func newInflight(ctx context.Context, sc *storage.Client, begin hipproto.UploadBegin, path string, tempKey string) *inflightUpload {
 	pr, pw := io.Pipe()
 	up := &inflightUpload{
 		streamID:     begin.StreamID,
 		bundlePath:   begin.BundlePath,
-		path:         begin.Path,
+		path:         path,
 		fingerprint:  begin.Fingerprint,
 		contentType:  begin.ContentType,
 		expectedSize: begin.Size,
