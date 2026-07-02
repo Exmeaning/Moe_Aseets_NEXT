@@ -284,7 +284,14 @@ func (s *session) handleHello(ctx context.Context, payload []byte) error {
 	if !s.srv.serverAllowed(h.Region) {
 		return s.sendFatal(ctx, hipproto.ErrCodeProtoViolation, "region not allowed")
 	}
-	if h.RunID == "" || h.AssetVersion == "" || h.AssetHash == "" {
+	// asset_hash is optional: nuverse-provider regions (tw/kr/cn) do not
+	// carry an asset_hash in their AssetBundleInfo — they identify a version
+	// solely by asset_version + per-bundle crc. Only require it for
+	// colorful_palette regions (jp/en) where the upstream always emits one.
+	if h.RunID == "" || h.AssetVersion == "" {
+		return s.sendFatal(ctx, hipproto.ErrCodeProtoViolation, "missing HELLO fields")
+	}
+	if (h.Region == "jp" || h.Region == "en") && h.AssetHash == "" {
 		return s.sendFatal(ctx, hipproto.ErrCodeProtoViolation, "missing HELLO fields")
 	}
 
