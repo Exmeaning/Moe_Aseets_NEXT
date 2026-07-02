@@ -1,0 +1,48 @@
+# Local development compose file. Spins up a single-node SeaweedFS + the
+# gateway. The updater client is expected to run on the host or in a separate
+# compose file / pod and connect to the gateway's HIP port.
+
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: server -filer -master.volumeSizeLimitMB=1024 -volume.max=0
+    # Filer HTTP defaults to :8888; master :9333; volume :8080 (mapped away
+    # to avoid collision with the gateway).
+    ports:
+      - "8888:8888"  # filer
+      - "9333:9333"  # master (debug only)
+    volumes:
+      - seaweed-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8888/"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    environment:
+      HARUKI_GW_HTTP_ADDR: ":8080"
+      # In compose the HIP port is bound on all interfaces of this container
+      # because sidecar clients live in different containers. In production
+      # on k3s/Zeabur, bind 127.0.0.1 and put the client in the same pod.
+      HARUKI_GW_HIP_ADDR: "0.0.0.0:7420"
+      HARUKI_GW_HIP_BEARER_TOKEN: "change-me-please"
+      HARUKI_GW_SEAWEED_FILER: "http://seaweedfs:8888"
+      HARUKI_GW_SQLITE_PATH: "/data/gateway.db"
+      HARUKI_GW_ALLOWED_SERVERS: "jp,en,tw,kr,cn"
+      HARUKI_GW_LOG_LEVEL: "info"
+    ports:
+      - "8080:8080"
+      - "7420:7420"
+    volumes:
+      - gateway-data:/data
+
+volumes:
+  seaweed-data:
+  gateway-data:

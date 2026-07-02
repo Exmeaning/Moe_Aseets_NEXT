@@ -1,0 +1,11 @@
+/bin/
+/out/
+/data/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.local
+.idea/
+.vscode/
+.narrafork/

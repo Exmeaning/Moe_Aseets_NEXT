@@ -1,0 +1,33 @@
+# Files that must never enter the build context.
+
+# Local build artefacts
+/bin/
+/out/
+/.gocache/
+
+# Local dev data
+/data/
+*.db
+*.db-wal
+*.db-shm
+.seaweed-data/
+
+# Secrets & env
+.env
+.env.*
+
+# Editor & VCS junk
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Docs and CI that don't affect the binary
+*.md
+!README.md
+/.github/
+/.narrafork/
+
+# Tests are included on purpose (integration_test.go is part of the tree),
+# but avoid dragging in any binary fixtures if they show up later.
+*.log
