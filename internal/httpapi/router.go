@@ -46,6 +46,9 @@ func (r *Router) Handler() http.Handler {
 	if r.Limiter != nil {
 		h = r.Limiter.Middleware(h)
 	}
+	// CORS is applied outermost so that OPTIONS preflights never spend a
+	// rate-limit token and never hit the proxy handler.
+	h = withCORS(h)
 	h = withAccessLog(h)
 	return h
 }
