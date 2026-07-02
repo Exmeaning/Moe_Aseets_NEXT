@@ -71,7 +71,7 @@ type sharedReuseEntry struct {
 // runSession is the per-connection entrypoint.
 func (srv *Server) runSession(ctx context.Context, conn net.Conn) {
 	log := srv.log.With("remote", conn.RemoteAddr().String())
-	log.Info("hip: session accepted")
+	log.Debug("hip: session accepted")
 	s := &session{
 		srv:         srv,
 		conn:        conn,
@@ -102,7 +102,14 @@ func (srv *Server) runSession(ctx context.Context, conn net.Conn) {
 	// cleanup: abort all outstanding uploads (they'll delete their tmp keys).
 	s.abortAllUploads(sctx)
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-		log.Warn("hip: session ended with error", "err", err)
+		// Sessions that never got past HELLO are almost always TCP health
+		// probes or port scans — noisy but harmless. Log them at DEBUG so
+		// real client errors still stand out at WARN.
+		if s.state == stateHandshake {
+			log.Debug("hip: pre-hello session dropped", "err", err)
+		} else {
+			log.Warn("hip: session ended with error", "err", err)
+		}
 		srv.counterSessions("abort")
 	} else if s.state == stateFinalized || s.state == stateClosed {
 		srv.counterSessions("commit")
@@ -136,7 +143,13 @@ func (s *session) heartbeat(ctx context.Context, done chan struct{}) {
 		case <-t.C:
 			// If the peer has been silent for > 60s, close.
 			if s.sinceLastRecv() > 60*time.Second {
-				s.log.Warn("hip: peer silent > 60s, closing")
+				// A silent pre-hello peer is almost always a health probe;
+				// don't spam WARN. Real client stalls happen after HELLO.
+				if s.state == stateHandshake {
+					s.log.Debug("hip: pre-hello peer silent, closing")
+				} else {
+					s.log.Warn("hip: peer silent > 60s, closing")
+				}
 				_ = s.conn.Close()
 				return
 			}
