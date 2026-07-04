@@ -441,6 +441,9 @@ func canonicalAssetPath(bundlePath, assetPath string) (string, error) {
 	if _, err := storage.SafeRelPath(assetPath); err != nil {
 		return "", err
 	}
+	if assetPath == bundlePath || strings.HasPrefix(assetPath, bundlePath+"/") {
+		return assetPath, nil
+	}
 	return bundlePath + "/" + assetPath, nil
 }
 
