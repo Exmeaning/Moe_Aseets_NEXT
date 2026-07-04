@@ -73,10 +73,18 @@ func CheckPath(ctx context.Context, db *sql.DB, server, path, fingerprint string
 // bundle_path here (before it has exported per-file asset paths), so this must
 // inspect bundle_path + fingerprint, not the canonical per-file public path.
 func CheckBundle(ctx context.Context, db *sql.DB, server, bundlePath, fingerprint string) (CheckDecision, error) {
+	completed, err := BundleCompleted(ctx, db, server, bundlePath, fingerprint)
+	if err != nil {
+		return CheckDecision{}, err
+	}
+	if completed {
+		return CheckDecision{Skip: true}, nil
+	}
+
 	// Same server already committed this bundle fingerprint: no need to download
 	// and export it again.
 	var one int
-	err := db.QueryRowContext(ctx, `SELECT 1 FROM assets WHERE server=? AND bundle_path=? AND fingerprint=? LIMIT 1`,
+	err = db.QueryRowContext(ctx, `SELECT 1 FROM assets WHERE server=? AND bundle_path=? AND fingerprint=? LIMIT 1`,
 		server, bundlePath, fingerprint).Scan(&one)
 	if err == nil {
 		return CheckDecision{Skip: true}, nil

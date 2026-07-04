@@ -260,6 +260,9 @@ type uploadItem struct {
 	wantPlacement string
 	// wantUploadStatus: expected UPLOAD_ACK.status ("OK", "SHA_MISMATCH", ...)
 	wantUploadStatus string
+	// skipUpload simulates a bundle that exported no files: CHECK says UPLOAD,
+	// but the client has no UPLOAD_BEGIN frames to send before COMMIT.
+	skipUpload bool
 }
 
 func runSession(t *testing.T, fx *fixture, region, appVersion, assetVersion, assetHash string, items []uploadItem) {
@@ -323,6 +326,9 @@ func runSession(t *testing.T, fx *fixture, region, appVersion, assetVersion, ass
 	for i, it := range items {
 		if items[i].wantAction != hipproto.ActionUpload {
 			stats.SkippedByCheck++
+			continue
+		}
+		if it.skipUpload {
 			continue
 		}
 		// UPLOAD_BEGIN
@@ -479,6 +485,34 @@ func TestEndToEndSharedThenOverride(t *testing.T) {
 	if code != 404 || missHeaders.Get("X-Miss") != "not-indexed" {
 		t.Fatalf("bare asset path should miss, got code=%d X-Miss=%q", code, missHeaders.Get("X-Miss"))
 	}
+}
+
+func TestZeroFileBundleCompletionSkipsAfterRestart(t *testing.T) {
+	fx := setUp(t)
+
+	const bundlePath = "zero/file/bundle"
+	const fingerprint = "zero-fp-1"
+
+	runSession(t, fx, "jp", "6.0.0", "6.0.0.10", "hash-zero", []uploadItem{
+		{
+			path:             "",
+			bundlePath:       bundlePath,
+			fingerprint:      fingerprint,
+			wantAction:       hipproto.ActionUpload,
+			wantPlacement:    hipproto.PlacementShared,
+			wantUploadStatus: hipproto.UploadStatusOK,
+			skipUpload:       true,
+		},
+	})
+
+	runSession(t, fx, "jp", "6.0.0", "6.0.0.10", "hash-zero", []uploadItem{
+		{
+			path:        "",
+			bundlePath:  bundlePath,
+			fingerprint: fingerprint,
+			wantAction:  hipproto.ActionSkip,
+		},
+	})
 }
 
 func TestShaMismatchRejected(t *testing.T) {

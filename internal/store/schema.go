@@ -32,4 +32,21 @@ CREATE TABLE IF NOT EXISTS versions (
     stats_json    TEXT NOT NULL,
     UNIQUE(server, asset_version, asset_hash)
 );
+
+CREATE TABLE IF NOT EXISTS bundle_completions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id    INTEGER NOT NULL,
+    server        TEXT NOT NULL,
+    asset_version TEXT NOT NULL,
+    asset_hash    TEXT NOT NULL,
+    bundle_path   TEXT NOT NULL,
+    fingerprint   TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    completed_at  INTEGER NOT NULL,
+    UNIQUE(server, asset_version, asset_hash, bundle_path)
+);
+CREATE INDEX IF NOT EXISTS idx_bundle_completions_lookup
+    ON bundle_completions(server, bundle_path, fingerprint);
+CREATE INDEX IF NOT EXISTS idx_bundle_completions_version
+    ON bundle_completions(version_id);
 `

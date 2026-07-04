@@ -150,9 +150,14 @@ func (c *Client) Copy(ctx context.Context, srcKey, dstKey string) error {
 	return c.Put(ctx, dstKey, resp.Body, size, ct)
 }
 
-// Ping does a HEAD on "/" to check the filer is reachable.
+// Ping checks the filer is reachable. It deliberately uses HEAD on a path
+// that is guaranteed not to exist (`/.gateway-ping-{unlikely}`); SeaweedFS
+// answers 404 quickly without rendering the directory listing template.
+// A GET on "/" would trigger the filer's HTML directory renderer, which
+// then logs a `broken pipe` every time we close the response early —
+// harmless but very noisy.
 func (c *Client) Ping(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.baseURL+"/.gateway-ping", nil)
 	if err != nil {
 		return err
 	}
@@ -160,7 +165,11 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Drain + close so keep-alive can reuse the conn.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+	// Any answer that isn't a 5xx means the filer is reachable and speaking
+	// HTTP. 404 is the expected, correct reply.
 	if resp.StatusCode >= 500 {
 		return fmt.Errorf("seaweed ping %s: %s", c.baseURL, resp.Status)
 	}

@@ -30,6 +30,20 @@ func insert(t *testing.T, db *sql.DB, a Asset) {
 	}
 }
 
+func insertBundleCompletion(t *testing.T, db *sql.DB, c BundleCompletion) {
+	t.Helper()
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertBundleCompletion(context.Background(), tx, c); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCheckPathFreshShared(t *testing.T) {
 	db := openMem(t)
 	d, err := CheckPath(context.Background(), db, "jp", "img/a.png", "111")
@@ -104,6 +118,35 @@ func TestCheckBundleUsesBundlePath(t *testing.T) {
 	}
 	if d.Skip || d.Placement != "OVERRIDE" {
 		t.Fatalf("changed bundle should upload as override: %+v", d)
+	}
+}
+
+func TestCheckBundleUsesBundleCompletion(t *testing.T) {
+	db := openMem(t)
+	insertBundleCompletion(t, db, BundleCompletion{
+		VersionID:    1,
+		Server:       "jp",
+		AssetVersion: "6.0.0.1",
+		AssetHash:    "hash-jp",
+		BundlePath:   "zero/file/bundle",
+		Fingerprint:  "123",
+		Source:       BundleCompletionSourceZeroFile,
+	})
+
+	completed, err := BundleCompleted(context.Background(), db, "jp", "zero/file/bundle", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !completed {
+		t.Fatal("expected bundle completion lookup to succeed")
+	}
+
+	d, err := CheckBundle(context.Background(), db, "jp", "zero/file/bundle", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Skip {
+		t.Fatalf("bundle completion should skip without asset rows: %+v", d)
 	}
 }
 

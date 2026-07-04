@@ -58,6 +58,8 @@ type session struct {
 	pending   []store.Asset // successful UPLOAD_ACKs
 	// (path, fingerprint) → SharedStorageKey when CHECK returned SKIP+SharedReuse.
 	sharedReuse map[string]sharedReuseEntry
+	bundlesMu   sync.Mutex
+	bundles     map[string]*checkedBundleEntry
 
 	// heartbeat state
 	lastRecvMu sync.Mutex
@@ -66,6 +68,70 @@ type session struct {
 
 type sharedReuseEntry struct {
 	server, path, fingerprint, storageKey string
+}
+
+type checkedBundleEntry struct {
+	bundlePath  string
+	fingerprint string
+	source      string
+	uploaded    bool
+}
+
+func bundleKey(bundlePath, fingerprint string) string {
+	return bundlePath + "\x00" + fingerprint
+}
+
+func (s *session) rememberCheckedBundle(bundlePath, fingerprint, source string) {
+	s.bundlesMu.Lock()
+	defer s.bundlesMu.Unlock()
+	key := bundleKey(bundlePath, fingerprint)
+	if existing, ok := s.bundles[key]; ok {
+		existing.source = source
+		return
+	}
+	s.bundles[key] = &checkedBundleEntry{
+		bundlePath:  bundlePath,
+		fingerprint: fingerprint,
+		source:      source,
+	}
+}
+
+func (s *session) markBundleUploaded(bundlePath, fingerprint string) {
+	s.bundlesMu.Lock()
+	defer s.bundlesMu.Unlock()
+	key := bundleKey(bundlePath, fingerprint)
+	entry, ok := s.bundles[key]
+	if !ok {
+		entry = &checkedBundleEntry{bundlePath: bundlePath, fingerprint: fingerprint}
+		s.bundles[key] = entry
+	}
+	entry.uploaded = true
+	entry.source = store.BundleCompletionSourceUploaded
+}
+
+func (s *session) bundleCompletions(versionID int64) []store.BundleCompletion {
+	s.bundlesMu.Lock()
+	defer s.bundlesMu.Unlock()
+	out := make([]store.BundleCompletion, 0, len(s.bundles))
+	for _, entry := range s.bundles {
+		source := entry.source
+		if source == "" {
+			source = store.BundleCompletionSourceZeroFile
+		}
+		if entry.uploaded {
+			source = store.BundleCompletionSourceUploaded
+		}
+		out = append(out, store.BundleCompletion{
+			VersionID:    versionID,
+			Server:       s.hello.Region,
+			AssetVersion: s.hello.AssetVersion,
+			AssetHash:    s.hello.AssetHash,
+			BundlePath:   entry.bundlePath,
+			Fingerprint:  entry.fingerprint,
+			Source:       source,
+		})
+	}
+	return out
 }
 
 // runSession is the per-connection entrypoint.
@@ -80,6 +146,7 @@ func (srv *Server) runSession(ctx context.Context, conn net.Conn) {
 		state:       stateHandshake,
 		uploads:     map[uint32]*inflightUpload{},
 		sharedReuse: map[string]sharedReuseEntry{},
+		bundles:     map[string]*checkedBundleEntry{},
 	}
 	s.updateLastRecv()
 
@@ -350,9 +417,11 @@ func (s *session) handleCheckBatch(ctx context.Context, payload []byte) error {
 		ack.Path = bundlePath
 		if d.Skip {
 			ack.Action = hipproto.ActionSkip
+			s.rememberCheckedBundle(bundlePath, item.Fingerprint, store.BundleCompletionSourceCheckSkip)
 		} else {
 			ack.Action = hipproto.ActionUpload
 			ack.Placement = d.Placement
+			s.rememberCheckedBundle(bundlePath, item.Fingerprint, store.BundleCompletionSourceZeroFile)
 		}
 		result.Results = append(result.Results, ack)
 	}
@@ -509,6 +578,7 @@ func (s *session) handleUploadEnd(ctx context.Context, payload []byte) error {
 		StorageKey:  finalKey,
 	})
 	s.pendingMu.Unlock()
+	s.markBundleUploaded(up.bundlePath, up.fingerprint)
 	s.dropInflight(end.StreamID)
 	s.srv.counterUploads("ok")
 
@@ -625,6 +695,14 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 		}
 	}
 
+	bundleCompletions := s.bundleCompletions(versionID)
+	for _, completion := range bundleCompletions {
+		if err := store.InsertBundleCompletion(ctx, tx, completion); err != nil {
+			rollback()
+			return s.sendFatal(ctx, hipproto.ErrCodeInternal, "insert bundle completion: "+err.Error())
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return s.sendFatal(ctx, hipproto.ErrCodeInternal, "commit tx: "+err.Error())
 	}
@@ -637,7 +715,7 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 	}
 
 	s.state = stateFinalized
-	s.log.Info("hip: COMMIT ok", "version_id", versionID, "assets", len(pending), "reuse", len(reuse))
+	s.log.Info("hip: COMMIT ok", "version_id", versionID, "assets", len(pending), "reuse", len(reuse), "bundle_completions", len(bundleCompletions))
 	return s.send(ctx, hipproto.FrameCommitAck, &hipproto.CommitAck{
 		VersionID:            uint64(versionID),
 		OverrideIndexRebuilt: true,
