@@ -47,6 +47,18 @@ type Frame struct {
 	Payload []byte
 }
 
+// FrameReader reads frames from a stream while reusing its payload buffer.
+// The returned Frame.Payload is valid only until the next ReadFrame call on
+// the same FrameReader.
+type FrameReader struct {
+	r   io.Reader
+	buf []byte
+}
+
+func NewFrameReader(r io.Reader) *FrameReader {
+	return &FrameReader{r: r}
+}
+
 // ErrFrameTooLarge is returned when the length prefix exceeds max.
 var ErrFrameTooLarge = errors.New("hipproto: frame exceeds max_frame")
 
@@ -95,6 +107,15 @@ func (t FrameType) String() string {
 // ReadFrame reads exactly one HIP frame from r. `maxFrame` is the negotiated
 // upper bound on `length` (i.e. type byte + payload).
 func ReadFrame(r io.Reader, maxFrame uint64) (Frame, error) {
+	return readFrame(r, maxFrame, nil)
+}
+
+// ReadFrame reads exactly one HIP frame from the underlying stream.
+func (fr *FrameReader) ReadFrame(maxFrame uint64) (Frame, error) {
+	return readFrame(fr.r, maxFrame, &fr.buf)
+}
+
+func readFrame(r io.Reader, maxFrame uint64, reusable *[]byte) (Frame, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return Frame{}, err
@@ -103,10 +124,19 @@ func ReadFrame(r io.Reader, maxFrame uint64) (Frame, error) {
 	if length == 0 {
 		return Frame{}, ErrShortFrame
 	}
-	if uint64(length) > maxFrame {
-		return Frame{}, fmt.Errorf("%w: got %d, max %d", ErrFrameTooLarge, length, maxFrame)
+	effectiveMax := effectiveMaxFrame(maxFrame)
+	if uint64(length) > effectiveMax {
+		return Frame{}, fmt.Errorf("%w: got %d, max %d", ErrFrameTooLarge, length, effectiveMax)
 	}
-	buf := make([]byte, length)
+	var buf []byte
+	if reusable == nil {
+		buf = make([]byte, length)
+	} else if cap(*reusable) < int(length) {
+		*reusable = make([]byte, length)
+		buf = *reusable
+	} else {
+		buf = (*reusable)[:length]
+	}
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return Frame{}, err
 	}
@@ -117,8 +147,9 @@ func ReadFrame(r io.Reader, maxFrame uint64) (Frame, error) {
 // upper bound on `length`.
 func WriteFrame(w io.Writer, f Frame, maxFrame uint64) error {
 	total := 1 + len(f.Payload)
-	if uint64(total) > maxFrame {
-		return fmt.Errorf("%w: got %d, max %d", ErrFrameTooLarge, total, maxFrame)
+	effectiveMax := effectiveMaxFrame(maxFrame)
+	if uint64(total) > effectiveMax {
+		return fmt.Errorf("%w: got %d, max %d", ErrFrameTooLarge, total, effectiveMax)
 	}
 	var hdr [5]byte
 	binary.BigEndian.PutUint32(hdr[:4], uint32(total))
@@ -132,4 +163,11 @@ func WriteFrame(w io.Writer, f Frame, maxFrame uint64) error {
 		}
 	}
 	return nil
+}
+
+func effectiveMaxFrame(maxFrame uint64) uint64 {
+	if maxFrame > HardMaxFrameBytes {
+		return HardMaxFrameBytes
+	}
+	return maxFrame
 }

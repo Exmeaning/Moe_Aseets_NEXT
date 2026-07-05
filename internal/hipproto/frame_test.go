@@ -39,10 +39,44 @@ func TestFrameEmptyPayload(t *testing.T) {
 	}
 }
 
+func TestFrameReaderRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, Frame{Type: FramePing, Payload: nil}, DefaultMaxFrameBytes); err != nil {
+		t.Fatalf("write ping: %v", err)
+	}
+	if err := WriteFrame(&buf, Frame{Type: FramePong, Payload: []byte("pong")}, DefaultMaxFrameBytes); err != nil {
+		t.Fatalf("write pong: %v", err)
+	}
+
+	fr := NewFrameReader(&buf)
+	first, err := fr.ReadFrame(DefaultMaxFrameBytes)
+	if err != nil {
+		t.Fatalf("read first: %v", err)
+	}
+	if first.Type != FramePing || len(first.Payload) != 0 {
+		t.Fatalf("bad first frame: %+v", first)
+	}
+	second, err := fr.ReadFrame(DefaultMaxFrameBytes)
+	if err != nil {
+		t.Fatalf("read second: %v", err)
+	}
+	if second.Type != FramePong || !bytes.Equal(second.Payload, []byte("pong")) {
+		t.Fatalf("bad second frame: %+v", second)
+	}
+}
+
 func TestFrameTooLarge(t *testing.T) {
 	// length prefix = 3, but maxFrame = 2 — reader should reject.
 	buf := bytes.NewBuffer([]byte{0, 0, 0, 3, 0x01, 0xaa, 0xbb})
 	_, err := ReadFrame(buf, 2)
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("want ErrFrameTooLarge, got %v", err)
+	}
+}
+
+func TestFrameHardCap(t *testing.T) {
+	buf := bytes.NewBuffer([]byte{4, 0, 0, 1})
+	_, err := ReadFrame(buf, HardMaxFrameBytes+1)
 	if !errors.Is(err, ErrFrameTooLarge) {
 		t.Fatalf("want ErrFrameTooLarge, got %v", err)
 	}

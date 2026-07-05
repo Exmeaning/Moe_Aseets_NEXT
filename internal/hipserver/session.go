@@ -276,11 +276,12 @@ func (s *session) heartbeat(ctx context.Context, done chan struct{}) {
 
 // readLoop is the single-reader per session.
 func (s *session) readLoop(ctx context.Context) error {
+	fr := hipproto.NewFrameReader(s.conn)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		frame, err := hipproto.ReadFrame(s.conn, s.maxFrame)
+		frame, err := fr.ReadFrame(s.maxFrame)
 		if err != nil {
 			return err
 		}
