@@ -82,6 +82,22 @@ func TestCheckPathCrossRegionSharedReuse(t *testing.T) {
 	}
 }
 
+func TestCheckPathCrossRegionSharedReuseCanUseOlderExactMatch(t *testing.T) {
+	db := openMem(t)
+	insert(t, db, Asset{Server: "jp", Path: "img/a.png", Version: "v1", Fingerprint: "111",
+		Sha256: "x", IsOverride: false, StorageKey: "/shared-assets/img/a-v1.png"})
+	insert(t, db, Asset{Server: "jp", Path: "img/a.png", Version: "v2", Fingerprint: "222",
+		Sha256: "y", IsOverride: false, StorageKey: "/shared-assets/img/a-v2.png"})
+
+	d, err := CheckPath(context.Background(), db, "en", "img/a.png", "111")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Skip || !d.SharedReuse || d.SharedStorageKey != "/shared-assets/img/a-v1.png" {
+		t.Fatalf("bad: %+v", d)
+	}
+}
+
 func TestCheckPathOverride(t *testing.T) {
 	db := openMem(t)
 	insert(t, db, Asset{Server: "jp", Path: "img/a.png", Version: "v1", Fingerprint: "111",
@@ -121,6 +137,24 @@ func TestCheckBundleUsesBundlePath(t *testing.T) {
 	}
 }
 
+func TestCheckBundleCrossRegionExactFingerprintReusesBundle(t *testing.T) {
+	db := openMem(t)
+	insert(t, db, Asset{
+		Server: "jp", BundlePath: "sound/foo",
+		Path: "sound/foo/a.mp3", Version: "v1",
+		Fingerprint: "bundle-fp", Sha256: "sha-a", IsOverride: false,
+		StorageKey: "/shared-assets/sound/foo/a.mp3",
+	})
+
+	d, err := CheckBundle(context.Background(), db, "kr", "sound/foo", "bundle-fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Skip || !d.BundleReuse {
+		t.Fatalf("same bundle fingerprint should be bundle reuse: %+v", d)
+	}
+}
+
 func TestCheckBundleUsesBundleCompletion(t *testing.T) {
 	db := openMem(t)
 	insertBundleCompletion(t, db, BundleCompletion{
@@ -150,6 +184,27 @@ func TestCheckBundleUsesBundleCompletion(t *testing.T) {
 	}
 }
 
+func TestCheckBundleCrossRegionBundleCompletionReusesBundle(t *testing.T) {
+	db := openMem(t)
+	insertBundleCompletion(t, db, BundleCompletion{
+		VersionID:    1,
+		Server:       "jp",
+		AssetVersion: "6.0.0",
+		AssetHash:    "hash-jp",
+		BundlePath:   "zero/file/bundle",
+		Fingerprint:  "123",
+		Source:       BundleCompletionSourceZeroFile,
+	})
+
+	d, err := CheckBundle(context.Background(), db, "kr", "zero/file/bundle", "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Skip || !d.BundleReuse {
+		t.Fatalf("cross-region bundle completion should be bundle reuse: %+v", d)
+	}
+}
+
 func TestInsertAssetUpsert(t *testing.T) {
 	db := openMem(t)
 	insert(t, db, Asset{Server: "jp", Path: "p", Version: "v1", Fingerprint: "1", Sha256: "a", Size: 10, StorageKey: "/k1"})
@@ -160,5 +215,37 @@ func TestInsertAssetUpsert(t *testing.T) {
 	}
 	if a.Sha256 != "b" || a.Size != 20 || a.StorageKey != "/k2" {
 		t.Fatalf("upsert didn't apply: %+v", a)
+	}
+}
+
+func TestReusableAssetBySHAPrefersShared(t *testing.T) {
+	db := openMem(t)
+	insert(t, db, Asset{Server: "cn", Path: "p", Version: "v1", Fingerprint: "1", Sha256: "same", Size: 10, IsOverride: true, StorageKey: "/overrides/cn/p"})
+	insert(t, db, Asset{Server: "jp", Path: "p", Version: "v1", Fingerprint: "1", Sha256: "same", Size: 10, IsOverride: false, StorageKey: "/shared-assets/p"})
+
+	a, ok, err := ReusableAssetBySHA(context.Background(), db, "same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || a.StorageKey != "/shared-assets/p" {
+		t.Fatalf("wanted shared reusable key, got ok=%v asset=%+v", ok, a)
+	}
+}
+
+func TestReusableBundleAssetsPrefersSharedAndOneRowPerPath(t *testing.T) {
+	db := openMem(t)
+	insert(t, db, Asset{Server: "cn", BundlePath: "b", Path: "b/a", Version: "v1", Fingerprint: "fp", Sha256: "sha", Size: 10, IsOverride: true, StorageKey: "/overrides/cn/b/a"})
+	insert(t, db, Asset{Server: "jp", BundlePath: "b", Path: "b/a", Version: "v1", Fingerprint: "fp", Sha256: "sha", Size: 10, IsOverride: false, StorageKey: "/shared-assets/b/a"})
+	insert(t, db, Asset{Server: "jp", BundlePath: "b", Path: "b/b", Version: "v1", Fingerprint: "fp", Sha256: "sha-b", Size: 20, IsOverride: false, StorageKey: "/shared-assets/b/b"})
+
+	assets, err := ReusableBundleAssets(context.Background(), db, "b", "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assets) != 2 {
+		t.Fatalf("wanted 2 unique paths, got %d: %+v", len(assets), assets)
+	}
+	if assets[0].Path != "b/a" || assets[0].StorageKey != "/shared-assets/b/a" {
+		t.Fatalf("wanted shared row for b/a first, got %+v", assets[0])
 	}
 }

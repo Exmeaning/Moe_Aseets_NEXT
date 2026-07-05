@@ -35,6 +35,10 @@ type CheckDecision struct {
 	// SharedFingerprintMatch indicates cross-region shared reuse (client did
 	// not upload, but this server still gains a versioned row on COMMIT).
 	SharedReuse bool
+	// BundleReuse indicates a pre-download bundle CHECK matched an existing
+	// bundle fingerprint from another server. The client can skip download and
+	// COMMIT will clone metadata rows for this server.
+	BundleReuse bool
 }
 
 // CheckPath applies §7.3 logic for one canonical public asset path
@@ -51,8 +55,20 @@ func CheckPath(ctx context.Context, db *sql.DB, server, path, fingerprint string
 		return CheckDecision{}, err
 	}
 
-	// 2) look up newest shared baseline for this canonical asset path.
-	var sharedFp, sharedKey string
+	// 2) exact shared match for this canonical asset path can be reused even
+	// if a newer shared row for the same path exists.
+	var sharedKey string
+	err = db.QueryRowContext(ctx, `SELECT storage_key FROM assets
+		WHERE path=? AND fingerprint=? AND is_override=0 ORDER BY id ASC LIMIT 1`, path, fingerprint).Scan(&sharedKey)
+	if err == nil {
+		return CheckDecision{Skip: true, SharedReuse: true, SharedStorageKey: sharedKey}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return CheckDecision{}, err
+	}
+
+	// 3) look up newest shared baseline for placement.
+	var sharedFp string
 	err = db.QueryRowContext(ctx, `SELECT fingerprint, storage_key FROM assets
 		WHERE path=? AND is_override=0 ORDER BY id DESC LIMIT 1`, path).Scan(&sharedFp, &sharedKey)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -94,7 +110,27 @@ func CheckBundle(ctx context.Context, db *sql.DB, server, bundlePath, fingerprin
 	}
 
 	// If a shared baseline for this exact bundle fingerprint exists, any region
-	// can read it through the shared index without region-specific rows.
+	// can skip download/export. COMMIT will clone metadata rows so the server
+	// has a versioned binding to the existing storage keys.
+	err = db.QueryRowContext(ctx, `SELECT 1 FROM assets WHERE bundle_path=? AND fingerprint=? LIMIT 1`,
+		bundlePath, fingerprint).Scan(&one)
+	if err == nil {
+		return CheckDecision{Skip: true, BundleReuse: true}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return CheckDecision{}, err
+	}
+	err = db.QueryRowContext(ctx, `SELECT 1 FROM bundle_completions WHERE bundle_path=? AND fingerprint=? LIMIT 1`,
+		bundlePath, fingerprint).Scan(&one)
+	if err == nil {
+		return CheckDecision{Skip: true, BundleReuse: true}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return CheckDecision{}, err
+	}
+
+	// If a shared baseline for this bundle path exists with a different
+	// fingerprint, the new bundle is an override for this server.
 	var sharedFp string
 	err = db.QueryRowContext(ctx, `SELECT fingerprint FROM assets
 		WHERE bundle_path=? AND is_override=0 ORDER BY id DESC LIMIT 1`, bundlePath).Scan(&sharedFp)
@@ -108,6 +144,38 @@ func CheckBundle(ctx context.Context, db *sql.DB, server, bundlePath, fingerprin
 		return CheckDecision{Skip: true}, nil
 	}
 	return CheckDecision{Placement: "OVERRIDE"}, nil
+}
+
+type queryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+// ReusableBundleAssets returns one reusable row per public path for an exact
+// bundle fingerprint. Rows are ordered to prefer shared storage keys.
+func ReusableBundleAssets(ctx context.Context, q queryer, bundlePath, fingerprint string) ([]Asset, error) {
+	rows, err := q.QueryContext(ctx, `SELECT id, server, bundle_path, path, version, fingerprint, sha256, size, is_override, storage_key, created_at
+		FROM assets WHERE bundle_path=? AND fingerprint=? AND storage_key<>''
+		ORDER BY path ASC, is_override ASC, id ASC`, bundlePath, fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	seen := map[string]struct{}{}
+	out := []Asset{}
+	for rows.Next() {
+		var a Asset
+		var iso int
+		if err := rows.Scan(&a.ID, &a.Server, &a.BundlePath, &a.Path, &a.Version, &a.Fingerprint, &a.Sha256, &a.Size, &iso, &a.StorageKey, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		if _, ok := seen[a.Path]; ok {
+			continue
+		}
+		seen[a.Path] = struct{}{}
+		a.IsOverride = iso == 1
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // InsertAsset upserts one row (uniqueness is (server, path, version)). Used
@@ -132,6 +200,28 @@ func InsertAsset(ctx context.Context, tx *sql.Tx, a Asset) error {
 			storage_key=excluded.storage_key
 	`, a.Server, a.BundlePath, a.Path, a.Version, a.Fingerprint, a.Sha256, a.Size, iso, a.StorageKey, a.CreatedAt)
 	return err
+}
+
+// ReusableAssetBySHA returns a committed asset with the same content hash.
+// Prefer shared rows when possible, but any committed storage key is reusable
+// because the read path dereferences the stored key directly.
+func ReusableAssetBySHA(ctx context.Context, db *sql.DB, sha256 string) (*Asset, bool, error) {
+	if sha256 == "" {
+		return nil, false, nil
+	}
+	row := db.QueryRowContext(ctx, `SELECT id, server, bundle_path, path, version, fingerprint, sha256, size, is_override, storage_key, created_at
+		FROM assets WHERE sha256=? AND storage_key<>'' ORDER BY is_override ASC, id ASC LIMIT 1`, sha256)
+	var a Asset
+	var iso int
+	err := row.Scan(&a.ID, &a.Server, &a.BundlePath, &a.Path, &a.Version, &a.Fingerprint, &a.Sha256, &a.Size, &iso, &a.StorageKey, &a.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	a.IsOverride = iso == 1
+	return &a, true, nil
 }
 
 // CurrentByServerPath returns the newest asset row for (server, path), or

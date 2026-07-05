@@ -75,24 +75,27 @@ type checkedBundleEntry struct {
 	fingerprint string
 	source      string
 	uploaded    bool
+	reuse       bool
 }
 
 func bundleKey(bundlePath, fingerprint string) string {
 	return bundlePath + "\x00" + fingerprint
 }
 
-func (s *session) rememberCheckedBundle(bundlePath, fingerprint, source string) {
+func (s *session) rememberCheckedBundle(bundlePath, fingerprint, source string, reuse bool) {
 	s.bundlesMu.Lock()
 	defer s.bundlesMu.Unlock()
 	key := bundleKey(bundlePath, fingerprint)
 	if existing, ok := s.bundles[key]; ok {
 		existing.source = source
+		existing.reuse = existing.reuse || reuse
 		return
 	}
 	s.bundles[key] = &checkedBundleEntry{
 		bundlePath:  bundlePath,
 		fingerprint: fingerprint,
 		source:      source,
+		reuse:       reuse,
 	}
 }
 
@@ -107,6 +110,34 @@ func (s *session) markBundleUploaded(bundlePath, fingerprint string) {
 	}
 	entry.uploaded = true
 	entry.source = store.BundleCompletionSourceUploaded
+}
+
+func (s *session) rememberSharedReuse(path, fingerprint, storageKey string) {
+	if storageKey == "" {
+		return
+	}
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	s.sharedReuse[crossRegionReuseKey(path, fingerprint)] = sharedReuseEntry{
+		server:      s.hello.Region,
+		path:        path,
+		fingerprint: fingerprint,
+		storageKey:  storageKey,
+	}
+}
+
+func (s *session) pendingStorageKeyBySHA(sha string) (string, bool) {
+	if sha == "" {
+		return "", false
+	}
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	for _, a := range s.pending {
+		if a.Sha256 == sha && a.StorageKey != "" {
+			return a.StorageKey, true
+		}
+	}
+	return "", false
 }
 
 func (s *session) bundleCompletions(versionID int64) []store.BundleCompletion {
@@ -130,6 +161,18 @@ func (s *session) bundleCompletions(versionID int64) []store.BundleCompletion {
 			Fingerprint:  entry.fingerprint,
 			Source:       source,
 		})
+	}
+	return out
+}
+
+func (s *session) bundleReuses() []checkedBundleEntry {
+	s.bundlesMu.Lock()
+	defer s.bundlesMu.Unlock()
+	out := []checkedBundleEntry{}
+	for _, entry := range s.bundles {
+		if entry.reuse {
+			out = append(out, *entry)
+		}
 	}
 	return out
 }
@@ -417,11 +460,11 @@ func (s *session) handleCheckBatch(ctx context.Context, payload []byte) error {
 		ack.Path = bundlePath
 		if d.Skip {
 			ack.Action = hipproto.ActionSkip
-			s.rememberCheckedBundle(bundlePath, item.Fingerprint, store.BundleCompletionSourceCheckSkip)
+			s.rememberCheckedBundle(bundlePath, item.Fingerprint, store.BundleCompletionSourceCheckSkip, d.BundleReuse)
 		} else {
 			ack.Action = hipproto.ActionUpload
 			ack.Placement = d.Placement
-			s.rememberCheckedBundle(bundlePath, item.Fingerprint, store.BundleCompletionSourceZeroFile)
+			s.rememberCheckedBundle(bundlePath, item.Fingerprint, store.BundleCompletionSourceZeroFile, false)
 		}
 		result.Results = append(result.Results, ack)
 	}
@@ -480,6 +523,9 @@ func (s *session) handleUploadBegin(ctx context.Context, payload []byte) error {
 		return s.sendFatal(ctx, hipproto.ErrCodeInternal, "check for placement")
 	}
 	if dec.Skip {
+		if dec.SharedReuse {
+			s.rememberSharedReuse(canonicalPath, begin.Fingerprint, dec.SharedStorageKey)
+		}
 		// Client shouldn't have started an upload; still ack (rejected) and
 		// keep session alive.
 		s.uploadsMu.Unlock()
@@ -544,26 +590,42 @@ func (s *session) handleUploadEnd(ctx context.Context, payload []byte) error {
 		}
 		return s.send(ctx, hipproto.FrameUploadAck, ackErr(end.StreamID, status, msg))
 	}
-	// Determine final key by placement decided on UPLOAD_BEGIN.
-	var finalKey string
-	isOverride := false
-	switch up.placement {
-	case hipproto.PlacementShared:
-		finalKey = storage.SharedKey(up.path)
-	case hipproto.PlacementOverride:
-		finalKey = storage.OverrideKey(s.hello.Region, up.path)
-		isOverride = true
-	default:
-		// Should not happen — placement was set at BEGIN. Recover as SHARED.
-		finalKey = storage.SharedKey(up.path)
+	// Determine final key by placement decided on UPLOAD_BEGIN. If the same
+	// content already exists, bind this row to the existing key instead of
+	// materialising another SeaweedFS object.
+	finalKey, reused := s.pendingStorageKeyBySHA(sha)
+	if !reused {
+		if existing, ok, err := store.ReusableAssetBySHA(ctx, s.srv.db, sha); err != nil {
+			s.log.Warn("hip: sha reuse lookup failed", "err", err, "sha256", sha)
+		} else if ok {
+			finalKey = existing.StorageKey
+			reused = true
+		}
 	}
-	// Copy tmp → final, then delete tmp.
-	if err := s.srv.storage.Copy(ctx, up.tempKey, finalKey); err != nil {
-		s.log.Warn("hip: copy tmp→final failed", "err", err, "src", up.tempKey, "dst", finalKey)
-		_ = s.srv.storage.Delete(ctx, up.tempKey)
-		s.dropInflight(end.StreamID)
-		s.srv.counterUploads("upstream_err")
-		return s.send(ctx, hipproto.FrameUploadAck, ackErr(end.StreamID, hipproto.UploadStatusRejected, "copy failed"))
+	isOverride := false
+	if !reused {
+		switch up.placement {
+		case hipproto.PlacementShared:
+			finalKey = storage.SharedKey(up.path)
+		case hipproto.PlacementOverride:
+			finalKey = storage.OverrideKey(s.hello.Region, up.path)
+			isOverride = true
+		default:
+			// Should not happen — placement was set at BEGIN. Recover as SHARED.
+			finalKey = storage.SharedKey(up.path)
+		}
+		// Copy tmp → final, then delete tmp.
+	} else if up.placement == hipproto.PlacementOverride {
+		isOverride = true
+	}
+	if !reused {
+		if err := s.srv.storage.Copy(ctx, up.tempKey, finalKey); err != nil {
+			s.log.Warn("hip: copy tmp→final failed", "err", err, "src", up.tempKey, "dst", finalKey)
+			_ = s.srv.storage.Delete(ctx, up.tempKey)
+			s.dropInflight(end.StreamID)
+			s.srv.counterUploads("upstream_err")
+			return s.send(ctx, hipproto.FrameUploadAck, ackErr(end.StreamID, hipproto.UploadStatusRejected, "copy failed"))
+		}
 	}
 	_ = s.srv.storage.Delete(ctx, up.tempKey)
 
@@ -673,10 +735,30 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 	pending := s.pending
 	reuse := s.sharedReuse
 	s.pendingMu.Unlock()
+	bundleReuses := s.bundleReuses()
 	for _, a := range pending {
 		if err := store.InsertAsset(ctx, tx, a); err != nil {
 			rollback()
 			return s.sendFatal(ctx, hipproto.ErrCodeInternal, "insert asset: "+err.Error())
+		}
+	}
+	bundleReuseAssets := 0
+	for _, br := range bundleReuses {
+		assets, err := store.ReusableBundleAssets(ctx, tx, br.bundlePath, br.fingerprint)
+		if err != nil {
+			rollback()
+			return s.sendFatal(ctx, hipproto.ErrCodeInternal, "load bundle reuse assets: "+err.Error())
+		}
+		for _, a := range assets {
+			a.ID = 0
+			a.Server = s.hello.Region
+			a.Version = s.hello.AssetVersion
+			a.CreatedAt = 0
+			if err := store.InsertAsset(ctx, tx, a); err != nil {
+				rollback()
+				return s.sendFatal(ctx, hipproto.ErrCodeInternal, "insert bundle reuse asset: "+err.Error())
+			}
+			bundleReuseAssets++
 		}
 	}
 	// Cross-region shared-reuse rows (no bytes were transferred, but we still
@@ -718,7 +800,7 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 	}
 
 	s.state = stateFinalized
-	s.log.Info("hip: COMMIT ok", "version_id", versionID, "assets", len(pending), "reuse", len(reuse), "bundle_completions", len(bundleCompletions))
+	s.log.Info("hip: COMMIT ok", "version_id", versionID, "assets", len(pending), "reuse", len(reuse), "bundle_reuses", len(bundleReuses), "bundle_reuse_assets", bundleReuseAssets, "bundle_completions", len(bundleCompletions))
 	return s.send(ctx, hipproto.FrameCommitAck, &hipproto.CommitAck{
 		VersionID:            uint64(versionID),
 		OverrideIndexRebuilt: true,

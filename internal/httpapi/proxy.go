@@ -75,13 +75,18 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var storeKey, serveFrom string
+	storeKey := res.StorageKey
+	var serveFrom string
 	if res.FromShared {
-		storeKey = storage.SharedKey(safe)
 		serveFrom = "shared"
 	} else {
-		storeKey = storage.OverrideKey(server, safe)
 		serveFrom = "override"
+	}
+	if storeKey == "" {
+		h.Metrics.requests(server, "miss_storage_key")
+		w.Header().Set("X-Miss", "storage-key")
+		http.NotFound(w, r)
+		return
 	}
 
 	// Pre-emit standard cache headers (they apply even to error responses that
