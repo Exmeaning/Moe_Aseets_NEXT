@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -67,7 +68,7 @@ type session struct {
 }
 
 type sharedReuseEntry struct {
-	server, path, fingerprint, storageKey string
+	server, bundlePath, path, fingerprint, storageKey string
 }
 
 type checkedBundleEntry struct {
@@ -112,7 +113,7 @@ func (s *session) markBundleUploaded(bundlePath, fingerprint string) {
 	entry.source = store.BundleCompletionSourceUploaded
 }
 
-func (s *session) rememberSharedReuse(path, fingerprint, storageKey string) {
+func (s *session) rememberSharedReuse(bundlePath, path, fingerprint, storageKey string) {
 	if storageKey == "" {
 		return
 	}
@@ -120,6 +121,7 @@ func (s *session) rememberSharedReuse(path, fingerprint, storageKey string) {
 	defer s.pendingMu.Unlock()
 	s.sharedReuse[crossRegionReuseKey(path, fingerprint)] = sharedReuseEntry{
 		server:      s.hello.Region,
+		bundlePath:  bundlePath,
 		path:        path,
 		fingerprint: fingerprint,
 		storageKey:  storageKey,
@@ -165,6 +167,14 @@ func (s *session) bundleCompletions(versionID int64) []store.BundleCompletion {
 	return out
 }
 
+func (s *session) bundleCompletionMap(versionID int64) map[string]store.BundleCompletion {
+	out := map[string]store.BundleCompletion{}
+	for _, completion := range s.bundleCompletions(versionID) {
+		mergeBundleCompletion(out, completion)
+	}
+	return out
+}
+
 func (s *session) bundleReuses() []checkedBundleEntry {
 	s.bundlesMu.Lock()
 	defer s.bundlesMu.Unlock()
@@ -174,6 +184,58 @@ func (s *session) bundleReuses() []checkedBundleEntry {
 			out = append(out, *entry)
 		}
 	}
+	return out
+}
+
+func mergeBundleCompletion(
+	completions map[string]store.BundleCompletion,
+	completion store.BundleCompletion,
+) {
+	if completion.BundlePath == "" {
+		return
+	}
+	if existing, ok := completions[completion.BundlePath]; ok {
+		if bundleCompletionSourceRank(existing.Source) > bundleCompletionSourceRank(completion.Source) {
+			return
+		}
+	}
+	completions[completion.BundlePath] = completion
+}
+
+func bundleCompletionSourceRank(source string) int {
+	switch source {
+	case store.BundleCompletionSourceUploaded:
+		return 3
+	case store.BundleCompletionSourceCheckSkip:
+		return 2
+	case store.BundleCompletionSourceZeroFile:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func normalizeBundleCompletionSource(source string) string {
+	switch source {
+	case store.BundleCompletionSourceUploaded,
+		store.BundleCompletionSourceCheckSkip,
+		store.BundleCompletionSourceZeroFile:
+		return source
+	default:
+		return store.BundleCompletionSourceZeroFile
+	}
+}
+
+func sortedBundleCompletions(
+	completions map[string]store.BundleCompletion,
+) []store.BundleCompletion {
+	out := make([]store.BundleCompletion, 0, len(completions))
+	for _, completion := range completions {
+		out = append(out, completion)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].BundlePath < out[j].BundlePath
+	})
 	return out
 }
 
@@ -525,7 +587,7 @@ func (s *session) handleUploadBegin(ctx context.Context, payload []byte) error {
 	}
 	if dec.Skip {
 		if dec.SharedReuse {
-			s.rememberSharedReuse(canonicalPath, begin.Fingerprint, dec.SharedStorageKey)
+			s.rememberSharedReuse(begin.BundlePath, canonicalPath, begin.Fingerprint, dec.SharedStorageKey)
 		}
 		// Client shouldn't have started an upload; still ack (rejected) and
 		// keep session alive.
@@ -767,7 +829,7 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 	for _, r := range reuse {
 		if err := store.InsertAsset(ctx, tx, store.Asset{
 			Server:      r.server,
-			BundlePath:  "", // unknown here — CHECK didn't carry bundle_path
+			BundlePath:  r.bundlePath,
 			Path:        r.path,
 			Version:     s.hello.AssetVersion,
 			Fingerprint: r.fingerprint,
@@ -781,7 +843,24 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 		}
 	}
 
-	bundleCompletions := s.bundleCompletions(versionID)
+	bundleCompletionMap := s.bundleCompletionMap(versionID)
+	for _, item := range c.CompletedBundles {
+		bundlePath := safeStripInvisible(item.Path)
+		if _, err := storage.SafeRelPath(bundlePath); err != nil {
+			rollback()
+			return s.sendFatal(ctx, hipproto.ErrCodeProtoViolation, "unsafe completed bundle path")
+		}
+		mergeBundleCompletion(bundleCompletionMap, store.BundleCompletion{
+			VersionID:    versionID,
+			Server:       s.hello.Region,
+			AssetVersion: s.hello.AssetVersion,
+			AssetHash:    s.hello.AssetHash,
+			BundlePath:   bundlePath,
+			Fingerprint:  item.Fingerprint,
+			Source:       normalizeBundleCompletionSource(item.Source),
+		})
+	}
+	bundleCompletions := sortedBundleCompletions(bundleCompletionMap)
 	for _, completion := range bundleCompletions {
 		if err := store.InsertBundleCompletion(ctx, tx, completion); err != nil {
 			rollback()
@@ -793,15 +872,13 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 		return s.sendFatal(ctx, hipproto.ErrCodeInternal, "commit tx: "+err.Error())
 	}
 
-	// Rebuild the in-memory index — read-path visibility flip.
-	if err := s.srv.idx.Rebuild(ctx, s.srv.db); err != nil {
-		s.log.Warn("hip: index rebuild failed", "err", err)
-		// Do NOT undo the commit — data is durable; readers will just still
-		// see the stale snapshot until the next successful rebuild.
-	}
+	// Rebuild the in-memory index in the background. The SQLite commit above is
+	// already durable, so COMMIT_ACK should not wait for a full assets-table
+	// scan as the table grows.
+	s.srv.scheduleIndexRebuild()
 
 	s.state = stateFinalized
-	s.log.Info("hip: COMMIT ok", "version_id", versionID, "assets", len(pending), "reuse", len(reuse), "bundle_reuses", len(bundleReuses), "bundle_reuse_assets", bundleReuseAssets, "bundle_completions", len(bundleCompletions))
+	s.log.Info("hip: COMMIT ok", "version_id", versionID, "assets", len(pending), "reuse", len(reuse), "bundle_reuses", len(bundleReuses), "bundle_reuse_assets", bundleReuseAssets, "bundle_completions", len(bundleCompletions), "index_rebuild", "scheduled")
 	return s.send(ctx, hipproto.FrameCommitAck, &hipproto.CommitAck{
 		VersionID:            uint64(versionID),
 		OverrideIndexRebuilt: true,

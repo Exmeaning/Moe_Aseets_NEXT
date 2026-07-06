@@ -23,7 +23,7 @@ func InsertVersion(ctx context.Context, tx *sql.Tx, v Version) (int64, error) {
 	if v.CommittedAt == 0 {
 		v.CommittedAt = time.Now().Unix()
 	}
-	res, err := tx.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO versions(server, app_version, asset_version, asset_hash, bundle_count, committed_at, stats_json)
 		VALUES(?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(server, asset_version, asset_hash) DO UPDATE SET
@@ -35,17 +35,11 @@ func InsertVersion(ctx context.Context, tx *sql.Tx, v Version) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	id, err := res.LastInsertId()
+	var id int64
+	err = tx.QueryRowContext(ctx, `SELECT id FROM versions WHERE server=? AND asset_version=? AND asset_hash=?`,
+		v.Server, v.AssetVersion, v.AssetHash).Scan(&id)
 	if err != nil {
 		return 0, err
-	}
-	if id == 0 {
-		// UPSERT case: re-select
-		err = tx.QueryRowContext(ctx, `SELECT id FROM versions WHERE server=? AND asset_version=? AND asset_hash=?`,
-			v.Server, v.AssetVersion, v.AssetHash).Scan(&id)
-		if err != nil {
-			return 0, err
-		}
 	}
 	return id, nil
 }

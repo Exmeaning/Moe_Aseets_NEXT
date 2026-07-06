@@ -515,6 +515,50 @@ func TestZeroFileBundleCompletionSkipsAfterRestart(t *testing.T) {
 	})
 }
 
+func TestCommitCompletedBundlesWithoutCheckSkipsAfterRestart(t *testing.T) {
+	fx := setUp(t)
+
+	const bundlePath = "zero/file/committed-by-uploader"
+	const fingerprint = "zero-fp-from-commit"
+
+	c := dial(t, fx.hipAddr)
+	c.send(t, hipproto.FrameHello, &hipproto.Hello{
+		Proto:            "hip",
+		Version:          1,
+		BearerToken:      "test-token",
+		Region:           "jp",
+		AppVersion:       "6.0.0",
+		AssetVersion:     "6.0.0.11",
+		AssetHash:        "hash-zero-commit",
+		RunID:            fmt.Sprintf("run-completed-%d", time.Now().UnixNano()),
+		UnpackerVersion:  "test/0.1",
+		ExpectedMaxFrame: hipproto.DefaultMaxFrameBytes,
+	})
+	_ = c.recv(t, hipproto.FrameHelloAck)
+	c.send(t, hipproto.FrameCommit, &hipproto.Commit{
+		BundleCount: 0,
+		Stats:       hipproto.CommitStats{},
+		CompletedBundles: []hipproto.CommitBundleCompletion{
+			{
+				Path:        bundlePath,
+				Fingerprint: fingerprint,
+				Source:      "zero_file",
+			},
+		},
+	})
+	_ = c.recv(t, hipproto.FrameCommitAck)
+	c.send(t, hipproto.FrameBye, nil)
+
+	runSession(t, fx, "jp", "6.0.0", "6.0.0.11", "hash-zero-commit", []uploadItem{
+		{
+			path:        "",
+			bundlePath:  bundlePath,
+			fingerprint: fingerprint,
+			wantAction:  hipproto.ActionSkip,
+		},
+	})
+}
+
 func TestShaMismatchRejected(t *testing.T) {
 	fx := setUp(t)
 	body := []byte("payload that will be corrupted at end frame")

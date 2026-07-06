@@ -33,8 +33,8 @@ type Config struct {
 // Metrics is an optional hook set. All fields are nil-safe.
 type Metrics struct {
 	SessionsActive func(delta int)
-	SessionsTotal  func(result string)                 // "commit" or "abort"
-	Uploads        func(status string)                 // "ok", "sha_mismatch", ...
+	SessionsTotal  func(result string) // "commit" or "abort"
+	Uploads        func(status string) // "ok", "sha_mismatch", ...
 	BytesIngested  func(delta uint64)
 }
 
@@ -50,6 +50,10 @@ type Server struct {
 	ln     net.Listener
 	closed chan struct{}
 	wg     sync.WaitGroup
+
+	rebuildMu      sync.Mutex
+	rebuildRunning bool
+	rebuildPending bool
 }
 
 // New wires the dependencies.
@@ -173,6 +177,42 @@ func (s *Server) counterUploads(status string) {
 func (s *Server) counterBytesIngested(n uint64) {
 	if s.metrics != nil && s.metrics.BytesIngested != nil {
 		s.metrics.BytesIngested(n)
+	}
+}
+
+func (s *Server) scheduleIndexRebuild() {
+	s.rebuildMu.Lock()
+	if s.rebuildRunning {
+		s.rebuildPending = true
+		s.rebuildMu.Unlock()
+		return
+	}
+	s.rebuildRunning = true
+	s.rebuildMu.Unlock()
+
+	go s.indexRebuildLoop()
+}
+
+func (s *Server) indexRebuildLoop() {
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		start := time.Now()
+		err := s.idx.Rebuild(ctx, s.db)
+		cancel()
+		if err != nil {
+			s.log.Warn("hip: index rebuild failed", "err", err)
+		} else {
+			s.log.Info("hip: index rebuild complete", "elapsed_ms", time.Since(start).Milliseconds())
+		}
+
+		s.rebuildMu.Lock()
+		if !s.rebuildPending {
+			s.rebuildRunning = false
+			s.rebuildMu.Unlock()
+			return
+		}
+		s.rebuildPending = false
+		s.rebuildMu.Unlock()
 	}
 }
 

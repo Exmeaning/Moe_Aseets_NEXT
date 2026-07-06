@@ -100,10 +100,10 @@ type UploadEnd struct {
 
 // UploadAckStatus values, matching the Rust client's expected strings.
 const (
-	UploadStatusOK            = "OK"
-	UploadStatusShaMismatch   = "SHA_MISMATCH"
-	UploadStatusSizeMismatch  = "SIZE_MISMATCH"
-	UploadStatusRejected      = "REJECTED"
+	UploadStatusOK           = "OK"
+	UploadStatusShaMismatch  = "SHA_MISMATCH"
+	UploadStatusSizeMismatch = "SIZE_MISMATCH"
+	UploadStatusRejected     = "REJECTED"
 )
 
 type UploadAck struct {
@@ -118,15 +118,22 @@ type UploadAck struct {
 // ---- Commit ----
 
 type CommitStats struct {
-	SkippedByLayer1 uint64 `msgpack:"skipped_by_layer1"`
-	SkippedByCheck  uint64 `msgpack:"skipped_by_check"`
-	UploadedShared  uint64 `msgpack:"uploaded_shared"`
+	SkippedByLayer1  uint64 `msgpack:"skipped_by_layer1"`
+	SkippedByCheck   uint64 `msgpack:"skipped_by_check"`
+	UploadedShared   uint64 `msgpack:"uploaded_shared"`
 	UploadedOverride uint64 `msgpack:"uploaded_override"`
 }
 
+type CommitBundleCompletion struct {
+	Path        string `msgpack:"path"`
+	Fingerprint string `msgpack:"fingerprint"`
+	Source      string `msgpack:"source,omitempty"`
+}
+
 type Commit struct {
-	BundleCount uint64      `msgpack:"bundle_count"`
-	Stats       CommitStats `msgpack:"stats"`
+	BundleCount      uint64                   `msgpack:"bundle_count"`
+	Stats            CommitStats              `msgpack:"stats"`
+	CompletedBundles []CommitBundleCompletion `msgpack:"completed_bundles,omitempty"`
 }
 
 type CommitAck struct {
