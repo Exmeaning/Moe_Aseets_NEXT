@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS bundle_completions (
 );
 CREATE INDEX IF NOT EXISTS idx_bundle_completions_lookup
     ON bundle_completions(server, bundle_path, fingerprint);
+CREATE INDEX IF NOT EXISTS idx_bundle_completions_bundle_fp
+    ON bundle_completions(bundle_path, fingerprint);
 CREATE INDEX IF NOT EXISTS idx_bundle_completions_version
     ON bundle_completions(version_id);
 `
