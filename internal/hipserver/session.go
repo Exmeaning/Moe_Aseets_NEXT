@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Team-Haruki/moe-assets-gateway/internal/hipproto"
@@ -65,6 +66,7 @@ type session struct {
 	// heartbeat state
 	lastRecvMu sync.Mutex
 	lastRecv   time.Time
+	processing atomic.Int32
 }
 
 type sharedReuseEntry struct {
@@ -315,6 +317,9 @@ func (s *session) heartbeat(ctx context.Context, done chan struct{}) {
 		case <-t.C:
 			// If the peer has been silent for > 60s, close.
 			if s.sinceLastRecv() > 60*time.Second {
+				if s.processing.Load() > 0 {
+					continue
+				}
 				// A silent pre-hello peer is almost always a health probe;
 				// don't spam WARN. Real client stalls happen after HELLO.
 				if s.state == stateHandshake {
@@ -348,9 +353,12 @@ func (s *session) readLoop(ctx context.Context) error {
 			return err
 		}
 		s.updateLastRecv()
+		s.processing.Add(1)
 		if err := s.dispatch(ctx, frame); err != nil {
+			s.processing.Add(-1)
 			return err
 		}
+		s.processing.Add(-1)
 	}
 }
 
