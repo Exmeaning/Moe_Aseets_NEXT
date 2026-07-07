@@ -10,9 +10,11 @@ import (
 type serverKey struct{}
 type relPathKey struct{}
 
-// Router wires the routes: /healthz, /metrics, /sekai-{server}-assets/*.
+// Router wires the routes: /healthz, /metrics, /api/assets/browse,
+// /sekai-{server}-assets/*.
 type Router struct {
 	Proxy   *ProxyHandler
+	Browser *AssetBrowserHandler
 	Metrics http.Handler // optional
 	Limiter *IPRateLimiter
 }
@@ -28,6 +30,9 @@ func (r *Router) Handler() http.Handler {
 
 	if r.Metrics != nil {
 		mux.Handle("/metrics", r.Metrics)
+	}
+	if r.Browser != nil {
+		mux.Handle("/api/assets/browse", r.Browser)
 	}
 
 	proxy := r.Proxy

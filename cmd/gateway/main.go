@@ -102,8 +102,13 @@ func run() error {
 		AllowedServers: cfg.AllowedServers,
 		Metrics:        proxyMetrics,
 	}
+	browser := &httpapi.AssetBrowserHandler{
+		Idx:            idx,
+		AllowedServers: cfg.AllowedServers,
+	}
 	router := &httpapi.Router{
 		Proxy:   proxy,
+		Browser: browser,
 		Metrics: reg.Handler(),
 		Limiter: httpapi.NewIPRateLimiter(cfg.HTTPRateLimitRPS, cfg.HTTPRateLimitBurst),
 	}

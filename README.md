@@ -20,8 +20,8 @@ Single-binary Go service that fronts SeaweedFS with two purposes:
    spoken by the [Haruki Sekai Asset Updater](https://github.com/Team-Haruki/Haruki-Sekai-Asset-Updater).
    One TCP session == one region's one atomic version commit. The server is
    authoritative for the SKIP / SHARED / OVERRIDE decision, streams sha256 of
-   every uploaded byte, and rebuilds the read-path index inside the same
-   COMMIT transaction.
+   every uploaded byte, commits metadata atomically, and publishes a rebuilt
+   read-path index after COMMIT.
 
 The spec lives in [`Haruki-Sekai-Asset-Updater/docs/hip.md`](https://github.com/Team-Haruki/Haruki-Sekai-Asset-Updater/blob/main/docs/hip.md).
 This project's wire format is verified to match by the integration tests in
@@ -37,7 +37,7 @@ internal/config/      # 12-factor env parsing
 internal/hipproto/    # HIP/1 frame + msgpack messages (no I/O)
 internal/hipserver/   # TCP accept loop + per-session state machine
 internal/store/       # SQLite schema, assets/versions layer, CHECK logic
-internal/index/       # atomic.Pointer[Snapshot] override index
+internal/index/       # atomic.Pointer[Snapshot] read + browser index
 internal/storage/     # SeaweedFS filer client (PUT/GET/HEAD/DELETE/Copy)
 internal/httpapi/     # Read-path HTTP router + reverse proxy + rate limit
 internal/metrics/     # Tiny stdlib-only Prometheus text exporter
@@ -105,6 +105,72 @@ Startup validation:
 | Auth | None (rate limited by IP) | Bearer in HELLO (constant-time compare) |
 | Bind | `0.0.0.0` | `127.0.0.1` by default; require TLS if binding to `0.0.0.0` |
 | Concurrency | High: fully lock-free per request | One TCP connection = one atomic version commit |
+
+---
+
+## HTTP API: asset browser
+
+`GET /api/assets/browse` returns a bounded, non-recursive directory listing of
+the current public assets for one region.
+
+Example:
+
+```bash
+curl 'http://localhost:8080/api/assets/browse?server=jp&prefix=event&limit=100'
+```
+
+Query parameters:
+
+| Name | Required | Default | Notes |
+|---|---:|---|---|
+| `server` | yes | - | One of the configured server tokens, e.g. `jp`, `en`, `tw`, `kr`, `cn`. |
+| `prefix` | no | root | Directory prefix to list. `event` and `event/` both list `event/`. Must be relative and canonical. |
+| `limit` | no | `100` | Page size. Values above `200` are capped to `200`. |
+| `cursor` | no | - | Opaque cursor from `nextCursor`. URL-encode it when sending the next page. |
+
+Response:
+
+```json
+{
+  "server": "jp",
+  "prefix": "event/",
+  "limit": 100,
+  "nextCursor": "event/foo/",
+  "snapshotRevision": 12,
+  "items": [
+    {
+      "type": "directory",
+      "name": "event_frontlines_2026",
+      "path": "event/event_frontlines_2026/"
+    },
+    {
+      "type": "asset",
+      "name": "logo.webp",
+      "path": "event/logo.webp",
+      "url": "/sekai-jp-assets/event/logo.webp",
+      "source": "shared",
+      "size": 12345,
+      "fingerprint": "123456789",
+      "sha256": "abcdef...",
+      "version": "6.0.0.1"
+    }
+  ]
+}
+```
+
+Operational constraints:
+
+- The API reads the immutable in-memory snapshot rebuilt after HIP commits. It
+  does not list SeaweedFS directories and does not query SQLite per request.
+- Listings are one directory level only. There is deliberately no recursive
+  full-tree dump and no public global fuzzy search endpoint.
+- Results are paginated and capped at 200 items per request.
+- Responses include `Cache-Control: public, max-age=30, stale-while-revalidate=60`.
+  The handler also keeps a small 15-second in-process cache keyed by snapshot
+  revision and query parameters.
+- `snapshotRevision` changes when the gateway publishes a rebuilt index. A HIP
+  COMMIT is durable before the rebuild completes, so browser API visibility can
+  lag a just-committed version briefly.
 
 ---
 
