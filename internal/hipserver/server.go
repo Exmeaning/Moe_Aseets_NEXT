@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Team-Haruki/moe-assets-gateway/internal/index"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/storage"
 )
 
@@ -38,26 +37,26 @@ type Metrics struct {
 	BytesIngested  func(delta uint64)
 }
 
+type CacheInvalidator interface {
+	InvalidatePaths(paths []string)
+}
+
 // Server owns the TCP listener and per-connection goroutines.
 type Server struct {
 	cfg     Config
 	db      *sql.DB
 	storage *storage.Client
-	idx     *index.Index
+	cache   CacheInvalidator
 	metrics *Metrics
 	log     *slog.Logger
 
 	ln     net.Listener
 	closed chan struct{}
 	wg     sync.WaitGroup
-
-	rebuildMu      sync.Mutex
-	rebuildRunning bool
-	rebuildPending bool
 }
 
 // New wires the dependencies.
-func New(cfg Config, db *sql.DB, sc *storage.Client, idx *index.Index, m *Metrics, log *slog.Logger) *Server {
+func New(cfg Config, db *sql.DB, sc *storage.Client, cache CacheInvalidator, m *Metrics, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -74,7 +73,7 @@ func New(cfg Config, db *sql.DB, sc *storage.Client, idx *index.Index, m *Metric
 		cfg:     cfg,
 		db:      db,
 		storage: sc,
-		idx:     idx,
+		cache:   cache,
 		metrics: m,
 		log:     log,
 		closed:  make(chan struct{}),
@@ -177,42 +176,6 @@ func (s *Server) counterUploads(status string) {
 func (s *Server) counterBytesIngested(n uint64) {
 	if s.metrics != nil && s.metrics.BytesIngested != nil {
 		s.metrics.BytesIngested(n)
-	}
-}
-
-func (s *Server) scheduleIndexRebuild() {
-	s.rebuildMu.Lock()
-	if s.rebuildRunning {
-		s.rebuildPending = true
-		s.rebuildMu.Unlock()
-		return
-	}
-	s.rebuildRunning = true
-	s.rebuildMu.Unlock()
-
-	go s.indexRebuildLoop()
-}
-
-func (s *Server) indexRebuildLoop() {
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		start := time.Now()
-		err := s.idx.Rebuild(ctx, s.db)
-		cancel()
-		if err != nil {
-			s.log.Warn("hip: index rebuild failed", "err", err)
-		} else {
-			s.log.Info("hip: index rebuild complete", "elapsed_ms", time.Since(start).Milliseconds())
-		}
-
-		s.rebuildMu.Lock()
-		if !s.rebuildPending {
-			s.rebuildRunning = false
-			s.rebuildMu.Unlock()
-			return
-		}
-		s.rebuildPending = false
-		s.rebuildMu.Unlock()
 	}
 }
 

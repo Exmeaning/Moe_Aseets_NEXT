@@ -21,6 +21,36 @@ CREATE INDEX IF NOT EXISTS idx_assets_bundle_fp ON assets(bundle_path, fingerpri
 CREATE INDEX IF NOT EXISTS idx_assets_sha       ON assets(sha256);
 CREATE INDEX IF NOT EXISTS idx_assets_current   ON assets(server, path);
 
+CREATE TABLE IF NOT EXISTS current_assets (
+    server      TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    version     TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    sha256      TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    is_override INTEGER NOT NULL,
+    storage_key TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY(server, path)
+);
+CREATE INDEX IF NOT EXISTS idx_current_assets_path
+    ON current_assets(path);
+
+CREATE TABLE IF NOT EXISTS current_shared_assets (
+    path        TEXT PRIMARY KEY,
+    version     TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    sha256      TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    storage_key TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS read_index_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS versions (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     server        TEXT NOT NULL,

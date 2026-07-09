@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
@@ -10,16 +11,17 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Team-Haruki/moe-assets-gateway/internal/index"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/storage"
+	"github.com/Team-Haruki/moe-assets-gateway/internal/store"
 )
 
 // ProxyHandler is the readonly reverse proxy for
 // GET /sekai-{server}-assets/{path...}.
 type ProxyHandler struct {
-	Idx     *index.Index
+	DB      *sql.DB
 	Storage *storage.Client
 	Log     *slog.Logger
+	Cache   *LookupCache
 	// AllowedServers is the whitelist derived from config.
 	AllowedServers map[string]struct{}
 	// Metrics hooks (nil-safe).
@@ -67,7 +69,19 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res := h.Idx.Load().Lookup(server, safe)
+	cacheKey := server + "\x00" + safe
+	res, ok := h.Cache.Get(cacheKey)
+	if !ok {
+		var err error
+		res, err = store.LookupPlacement(r.Context(), h.DB, server, safe)
+		if err != nil {
+			h.Log.Error("lookup failed", "err", err, "server", server, "path", safe)
+			h.Metrics.requests(server, "lookup_err")
+			http.Error(w, "lookup error", http.StatusInternalServerError)
+			return
+		}
+		h.Cache.Set(cacheKey, res)
+	}
 	if !res.Found {
 		h.Metrics.requests(server, "miss_index")
 		w.Header().Set("X-Miss", "not-indexed")

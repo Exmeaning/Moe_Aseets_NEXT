@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Team-Haruki/moe-assets-gateway/internal/index"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/storage"
+	"github.com/Team-Haruki/moe-assets-gateway/internal/store"
 )
 
 const (
@@ -23,9 +24,10 @@ const (
 )
 
 // AssetBrowserHandler exposes a bounded JSON directory listing for the public
-// asset browser. It reads only the immutable in-memory index snapshot.
+// asset browser. It builds pages from SQLite on demand to avoid holding a full
+// process-wide directory tree for every asset path.
 type AssetBrowserHandler struct {
-	Idx            *index.Index
+	DB             *sql.DB
 	AllowedServers map[string]struct{}
 	DefaultLimit   int
 	MaxLimit       int
@@ -68,7 +70,7 @@ func (h *AssetBrowserHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if h.Idx == nil {
+	if h.DB == nil {
 		http.Error(w, "asset browser unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -99,20 +101,28 @@ func (h *AssetBrowserHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	snap := h.Idx.Load()
-	cacheKey := fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%d", snap.Revision, server, prefix, cursor, limit)
+	revision, err := store.LatestAssetID(r.Context(), h.DB)
+	if err != nil {
+		http.Error(w, "lookup revision", http.StatusInternalServerError)
+		return
+	}
+	cacheKey := fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%d", revision, server, prefix, cursor, limit)
 	if body, ok := h.getCached(cacheKey); ok {
 		writeBrowseJSON(w, r, body)
 		return
 	}
 
-	result := snap.Browse(server, prefix, cursor, limit)
+	result, err := store.BrowseCurrent(r.Context(), h.DB, server, prefix, cursor, limit)
+	if err != nil {
+		http.Error(w, "browse assets", http.StatusInternalServerError)
+		return
+	}
 	resp := assetBrowseResponse{
 		Server:           server,
 		Prefix:           prefix,
 		Limit:            limit,
 		NextCursor:       result.NextCursor,
-		SnapshotRevision: snap.Revision,
+		SnapshotRevision: result.Revision,
 		Items:            make([]assetBrowseItem, 0, len(result.Items)),
 	}
 	for _, item := range result.Items {
@@ -207,13 +217,13 @@ func writeBrowseJSON(w http.ResponseWriter, r *http.Request, body []byte) {
 	_, _ = w.Write(body)
 }
 
-func toAssetBrowseItem(server string, entry index.BrowseEntry) assetBrowseItem {
+func toAssetBrowseItem(server string, entry store.BrowseEntry) assetBrowseItem {
 	item := assetBrowseItem{
 		Type: entry.Kind,
 		Name: entry.Name,
 		Path: entry.Path,
 	}
-	if entry.Kind != index.BrowseKindAsset {
+	if entry.Kind != store.BrowseKindAsset {
 		return item
 	}
 	source := "override"

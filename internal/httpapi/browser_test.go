@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Team-Haruki/moe-assets-gateway/internal/index"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/store"
 )
 
@@ -39,12 +38,8 @@ func TestAssetBrowserHandlerListsPagedDirectory(t *testing.T) {
 	insertBrowserAsset(t, db, store.Asset{Server: "en", Path: "img/a.png", Version: "v2", Fingerprint: "override-a", Sha256: "sha-override",
 		IsOverride: true, StorageKey: "/overrides/en/img/a.png", Size: 300})
 
-	idx := index.New()
-	if err := idx.Rebuild(context.Background(), db); err != nil {
-		t.Fatal(err)
-	}
 	handler := &AssetBrowserHandler{
-		Idx:            idx,
+		DB:             db,
 		AllowedServers: map[string]struct{}{"en": {}},
 	}
 
@@ -66,7 +61,7 @@ func TestAssetBrowserHandlerListsPagedDirectory(t *testing.T) {
 		t.Fatalf("items=%d: %+v", len(resp.Items), resp.Items)
 	}
 	item := resp.Items[0]
-	if item.Type != index.BrowseKindAsset || item.Path != "img/a.png" || item.Source != "override" || item.URL != "/sekai-en-assets/img/a.png" {
+	if item.Type != store.BrowseKindAsset || item.Path != "img/a.png" || item.Source != "override" || item.URL != "/sekai-en-assets/img/a.png" {
 		t.Fatalf("bad item: %+v", item)
 	}
 	if item.Size == nil || *item.Size != 300 || item.Fingerprint != "override-a" {
@@ -83,15 +78,19 @@ func TestAssetBrowserHandlerListsPagedDirectory(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Items) != 1 || resp.Items[0].Type != index.BrowseKindDirectory || resp.Items[0].Path != "img/sub/" || resp.NextCursor != "" {
+	if len(resp.Items) != 1 || resp.Items[0].Type != store.BrowseKindDirectory || resp.Items[0].Path != "img/sub/" || resp.NextCursor != "" {
 		t.Fatalf("bad second page: %+v", resp)
 	}
 }
 
 func TestAssetBrowserHandlerRejectsBadInput(t *testing.T) {
-	idx := index.New()
+	db, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
 	handler := &AssetBrowserHandler{
-		Idx:            idx,
+		DB:             db,
 		AllowedServers: map[string]struct{}{"jp": {}},
 	}
 

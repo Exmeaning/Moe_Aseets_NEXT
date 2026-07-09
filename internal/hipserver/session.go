@@ -241,6 +241,15 @@ func sortedBundleCompletions(
 	return out
 }
 
+func sortedPathKeys(paths map[string]struct{}) []string {
+	out := make([]string, 0, len(paths))
+	for path := range paths {
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // runSession is the per-connection entrypoint.
 func (srv *Server) runSession(ctx context.Context, conn net.Conn) {
 	log := srv.log.With("remote", conn.RemoteAddr().String())
@@ -807,10 +816,14 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 	reuse := s.sharedReuse
 	s.pendingMu.Unlock()
 	bundleReuses := s.bundleReuses()
+	changedPaths := map[string]struct{}{}
 	for _, a := range pending {
 		if err := store.InsertAsset(ctx, tx, a); err != nil {
 			rollback()
 			return s.sendFatal(ctx, hipproto.ErrCodeInternal, "insert asset: "+err.Error())
+		}
+		if a.Path != "" {
+			changedPaths[a.Path] = struct{}{}
 		}
 	}
 	bundleReuseAssets := 0
@@ -828,6 +841,9 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 			if err := store.InsertAsset(ctx, tx, a); err != nil {
 				rollback()
 				return s.sendFatal(ctx, hipproto.ErrCodeInternal, "insert bundle reuse asset: "+err.Error())
+			}
+			if a.Path != "" {
+				changedPaths[a.Path] = struct{}{}
 			}
 			bundleReuseAssets++
 		}
@@ -848,6 +864,9 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 		}); err != nil {
 			rollback()
 			return s.sendFatal(ctx, hipproto.ErrCodeInternal, "insert reuse asset: "+err.Error())
+		}
+		if r.path != "" {
+			changedPaths[r.path] = struct{}{}
 		}
 	}
 
@@ -875,18 +894,21 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 			return s.sendFatal(ctx, hipproto.ErrCodeInternal, "insert bundle completion: "+err.Error())
 		}
 	}
+	if err := store.MarkReadIndexCurrent(ctx, tx); err != nil {
+		rollback()
+		return s.sendFatal(ctx, hipproto.ErrCodeInternal, "mark read index current: "+err.Error())
+	}
 
 	if err := tx.Commit(); err != nil {
 		return s.sendFatal(ctx, hipproto.ErrCodeInternal, "commit tx: "+err.Error())
 	}
-
-	// Rebuild the in-memory index in the background. The SQLite commit above is
-	// already durable, so COMMIT_ACK should not wait for a full assets-table
-	// scan as the table grows.
-	s.srv.scheduleIndexRebuild()
+	invalidatedPaths := sortedPathKeys(changedPaths)
+	if s.srv.cache != nil && len(invalidatedPaths) > 0 {
+		s.srv.cache.InvalidatePaths(invalidatedPaths)
+	}
 
 	s.state = stateFinalized
-	s.log.Info("hip: COMMIT ok", "version_id", versionID, "assets", len(pending), "reuse", len(reuse), "bundle_reuses", len(bundleReuses), "bundle_reuse_assets", bundleReuseAssets, "bundle_completions", len(bundleCompletions), "index_rebuild", "scheduled")
+	s.log.Info("hip: COMMIT ok", "version_id", versionID, "assets", len(pending), "reuse", len(reuse), "bundle_reuses", len(bundleReuses), "bundle_reuse_assets", bundleReuseAssets, "bundle_completions", len(bundleCompletions), "cache_invalidated_paths", len(invalidatedPaths))
 	return s.send(ctx, hipproto.FrameCommitAck, &hipproto.CommitAck{
 		VersionID:            uint64(versionID),
 		OverrideIndexRebuilt: true,

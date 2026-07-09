@@ -199,7 +199,16 @@ func InsertAsset(ctx context.Context, tx *sql.Tx, a Asset) error {
 			is_override=excluded.is_override,
 			storage_key=excluded.storage_key
 	`, a.Server, a.BundlePath, a.Path, a.Version, a.Fingerprint, a.Sha256, a.Size, iso, a.StorageKey, a.CreatedAt)
-	return err
+	if err != nil {
+		return err
+	}
+	if err := upsertCurrentAsset(ctx, tx, a, iso); err != nil {
+		return err
+	}
+	if !a.IsOverride {
+		return upsertCurrentSharedAsset(ctx, tx, a)
+	}
+	return nil
 }
 
 // ReusableAssetBySHA returns a committed asset with the same content hash.

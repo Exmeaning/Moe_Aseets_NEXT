@@ -25,6 +25,8 @@ type Config struct {
 
 	HTTPRateLimitRPS   float64
 	HTTPRateLimitBurst int
+	LookupCacheItems   int
+	LookupCacheTTL     int
 
 	AllowedServers map[string]struct{}
 
@@ -63,6 +65,16 @@ func FromEnv() (Config, error) {
 		return c, err
 	}
 	c.HTTPRateLimitBurst = int(burst)
+	cacheItems, err := envUint64("HARUKI_GW_LOOKUP_CACHE_ITEMS", 100000)
+	if err != nil {
+		return c, err
+	}
+	c.LookupCacheItems = int(cacheItems)
+	cacheTTL, err := envUint64("HARUKI_GW_LOOKUP_CACHE_TTL_SECONDS", 86400)
+	if err != nil {
+		return c, err
+	}
+	c.LookupCacheTTL = int(cacheTTL)
 
 	servers := envDefault("HARUKI_GW_ALLOWED_SERVERS", "jp,en,tw,kr,cn")
 	c.AllowedServers = map[string]struct{}{}

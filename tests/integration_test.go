@@ -35,7 +35,6 @@ import (
 	"github.com/Team-Haruki/moe-assets-gateway/internal/hipproto"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/hipserver"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/httpapi"
-	"github.com/Team-Haruki/moe-assets-gateway/internal/index"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/storage"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/store"
 )
@@ -196,10 +195,7 @@ func setUp(t *testing.T) *fixture {
 	t.Cleanup(func() { db.Close() })
 
 	sc := storage.New(filerSrv.URL)
-	idx := index.New()
-	if err := idx.Rebuild(context.Background(), db); err != nil {
-		t.Fatalf("rebuild idx: %v", err)
-	}
+	lookupCache := httpapi.NewLookupCache(1000, time.Hour)
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	// HIP server on an ephemeral port
@@ -210,7 +206,7 @@ func setUp(t *testing.T) *fixture {
 		MaxInFlightUploads: 4,
 		AllowedServers:     map[string]struct{}{"jp": {}, "en": {}, "tw": {}, "kr": {}, "cn": {}},
 		ServerVersion:      "test-gw/1",
-	}, db, sc, idx, nil, log)
+	}, db, sc, lookupCache, nil, log)
 
 	hipCtx, hipCancel := context.WithCancel(context.Background())
 	go func() { _ = hipSrv.ListenAndServe(hipCtx) }()
@@ -229,10 +225,11 @@ func setUp(t *testing.T) *fixture {
 
 	// HTTP read path on an ephemeral port
 	proxy := &httpapi.ProxyHandler{
-		Idx:            idx,
+		DB:             db,
 		Storage:        sc,
 		Log:            log,
 		AllowedServers: map[string]struct{}{"jp": {}, "en": {}, "tw": {}, "kr": {}, "cn": {}},
+		Cache:          lookupCache,
 	}
 	router := &httpapi.Router{Proxy: proxy}
 	httpSrv := httptest.NewServer(router.Handler())

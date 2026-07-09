@@ -216,6 +216,46 @@ func TestInsertAssetUpsert(t *testing.T) {
 	if a.Sha256 != "b" || a.Size != 20 || a.StorageKey != "/k2" {
 		t.Fatalf("upsert didn't apply: %+v", a)
 	}
+	res, err := LookupPlacement(context.Background(), db, "jp", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Found || res.StorageKey != "/k2" {
+		t.Fatalf("current read index not updated: %+v", res)
+	}
+}
+
+func TestEnsureReadIndexesBackfillsLegacyAssets(t *testing.T) {
+	db := openMem(t)
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO assets(server, bundle_path, path, version, fingerprint, sha256, size, is_override, storage_key, created_at)
+		VALUES
+			('jp', 'b', 'img/a.png', 'v1', 'old', 'sha-old', 10, 0, '/shared-assets/img/a-old.png', 1),
+			('jp', 'b', 'img/a.png', 'v2', 'new', 'sha-new', 20, 0, '/shared-assets/img/a-new.png', 2),
+			('en', 'b', 'img/a.png', 'v2', 'override', 'sha-override', 30, 1, '/overrides/en/img/a.png', 3)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureReadIndexes(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+
+	jp, err := LookupPlacement(context.Background(), db, "jp", "img/a.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !jp.Found || !jp.FromShared || jp.StorageKey != "/shared-assets/img/a-new.png" {
+		t.Fatalf("bad jp placement: %+v", jp)
+	}
+	en, err := LookupPlacement(context.Background(), db, "en", "img/a.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !en.Found || en.FromShared || en.StorageKey != "/overrides/en/img/a.png" {
+		t.Fatalf("bad en placement: %+v", en)
+	}
 }
 
 func TestReusableAssetBySHAPrefersShared(t *testing.T) {

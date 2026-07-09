@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
-	"github.com/Team-Haruki/moe-assets-gateway/internal/index"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/storage"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/store"
 )
@@ -50,15 +50,12 @@ func TestProxyUsesIndexedStorageKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	idx := index.New()
-	if err := idx.Rebuild(context.Background(), db); err != nil {
-		t.Fatal(err)
-	}
 	handler := &ProxyHandler{
-		Idx:            idx,
+		DB:             db,
 		Storage:        storage.New(upstream.URL),
 		Log:            slog.Default(),
 		AllowedServers: map[string]struct{}{"kr": {}},
+		Cache:          NewLookupCache(100, time.Hour),
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/ignored", nil)

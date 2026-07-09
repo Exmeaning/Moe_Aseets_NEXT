@@ -20,7 +20,6 @@ import (
 	"github.com/Team-Haruki/moe-assets-gateway/internal/config"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/hipserver"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/httpapi"
-	"github.com/Team-Haruki/moe-assets-gateway/internal/index"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/metrics"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/storage"
 	"github.com/Team-Haruki/moe-assets-gateway/internal/store"
@@ -69,10 +68,15 @@ func run() error {
 	}
 	pingCancel()
 
-	idx := index.New()
-	if err := idx.Rebuild(context.Background(), db); err != nil {
+	indexCtx, indexCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	indexStart := time.Now()
+	log.Info("read index: ensuring materialized sqlite tables")
+	if err := store.EnsureReadIndexes(indexCtx, db); err != nil {
+		indexCancel()
 		return err
 	}
+	indexCancel()
+	log.Info("read index: ready", "elapsed_ms", time.Since(indexStart).Milliseconds())
 
 	// ---- Metrics registry ----
 	reg := metrics.NewRegistry()
@@ -95,15 +99,20 @@ func run() error {
 	}
 
 	// ---- HTTP read port ----
+	lookupCache := httpapi.NewLookupCache(
+		cfg.LookupCacheItems,
+		time.Duration(cfg.LookupCacheTTL)*time.Second,
+	)
 	proxy := &httpapi.ProxyHandler{
-		Idx:            idx,
+		DB:             db,
 		Storage:        sc,
 		Log:            log,
 		AllowedServers: cfg.AllowedServers,
 		Metrics:        proxyMetrics,
+		Cache:          lookupCache,
 	}
 	browser := &httpapi.AssetBrowserHandler{
-		Idx:            idx,
+		DB:             db,
 		AllowedServers: cfg.AllowedServers,
 	}
 	router := &httpapi.Router{
@@ -129,7 +138,7 @@ func run() error {
 		MaxInFlightUploads: cfg.MaxInFlightUploads,
 		AllowedServers:     cfg.AllowedServers,
 		ServerVersion:      "moe-assets-gateway/1",
-	}, db, sc, idx, hipMetrics, log)
+	}, db, sc, lookupCache, hipMetrics, log)
 
 	// ---- run loop with signal handling ----
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
