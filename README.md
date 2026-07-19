@@ -174,6 +174,105 @@ Operational constraints:
 
 ---
 
+## HTTP API: version history & update diff
+
+`GET /api/assets/versions` lists the committed asset versions of one region,
+newest first. `GET /api/assets/diff` returns what one version changed — the
+frontend flow is: pick a version from the list, then follow its `diffUrl`.
+
+```bash
+curl 'http://localhost:8080/api/assets/versions?server=jp&limit=20'
+curl 'http://localhost:8080/api/assets/diff?server=jp&version=6.0.0.11&limit=100'
+```
+
+### `GET /api/assets/versions`
+
+| Name | Required | Default | Notes |
+|---|---:|---|---|
+| `server` | yes | - | One of the configured server tokens. |
+| `limit` | no | `100` | Page size, capped at `200`. |
+| `cursor` | no | - | Opaque numeric cursor from `nextCursor`. |
+
+```json
+{
+  "server": "jp",
+  "limit": 20,
+  "nextCursor": "41",
+  "items": [
+    {
+      "assetVersion": "6.0.0.11",
+      "appVersion": "6.0.0",
+      "assetHash": "abcd...",
+      "bundleCount": 4096,
+      "committedAt": 1751234567,
+      "changedAssets": 1234,
+      "stats": {"skipped_by_layer1": 100, "uploaded_shared": 34},
+      "diffUrl": "/api/assets/diff?server=jp&version=6.0.0.11"
+    }
+  ]
+}
+```
+
+`changedAssets` counts every asset row the commit minted (all file types);
+`stats` is the client-reported COMMIT stats JSON passed through verbatim.
+
+### `GET /api/assets/diff`
+
+| Name | Required | Default | Notes |
+|---|---:|---|---|
+| `server` | yes | - | One of the configured server tokens. |
+| `version` | yes | - | An `assetVersion` from the versions endpoint. Unknown → `404`. |
+| `types` | no | `webp,mp3,json` | Comma-separated extension whitelist to keep payloads small. `types=all` disables filtering. Tokens are `[a-z0-9]`, max 16. |
+| `limit` | no | `100` | Page size, capped at `200`. |
+| `cursor` | no | - | Opaque `size:path` cursor from `nextCursor`. URL-encode it. |
+
+```json
+{
+  "server": "jp",
+  "assetVersion": "6.0.0.11",
+  "appVersion": "6.0.0",
+  "assetHash": "abcd...",
+  "committedAt": 1751234567,
+  "types": ["webp", "mp3", "json"],
+  "totalChanged": 890,
+  "limit": 100,
+  "nextCursor": "52341:event/foo/bg.webp",
+  "items": [
+    {
+      "changeType": "updated",
+      "path": "event/foo/bg.webp",
+      "url": "/sekai-jp-assets/event/foo/bg.webp",
+      "source": "shared",
+      "size": 152341,
+      "fingerprint": "123456789",
+      "sha256": "abcdef...",
+      "bundlePath": "event/foo"
+    }
+  ]
+}
+```
+
+Semantics & operational constraints:
+
+- The diff of a version is exactly the asset rows its COMMIT minted: files the
+  region gained (`changeType: "added"`) or whose content changed
+  (`changeType: "updated"`). Files skipped because the region already had the
+  identical bytes produce no row. The store never deletes, so there is no
+  "removed" change type.
+- Items are ordered largest-first (`size DESC`, `path ASC` for ties), so one
+  page is enough to show a version's heaviest additions.
+- `totalChanged` is computed with the active `types` filter applied, so it
+  always matches what pagination will eventually return.
+- Cross-region reuse rows (a region adopting already-uploaded shared bytes)
+  report `size: 0` and no `sha256` — no bytes travelled for them.
+- Both endpoints page through SQLite via the `(server, version, path)` index:
+  the page query touches only the requested version's delta rows and the
+  counts are covering-index-only. Responses carry the same
+  `Cache-Control: public, max-age=30, stale-while-revalidate=60` and 15-second
+  in-process cache as the browser API.
+
+---
+
 ## HIP/1 wire format (summary)
 
 Frame layout:

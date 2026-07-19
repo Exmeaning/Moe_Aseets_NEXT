@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -231,7 +232,13 @@ func setUp(t *testing.T) *fixture {
 		AllowedServers: map[string]struct{}{"jp": {}, "en": {}, "tw": {}, "kr": {}, "cn": {}},
 		Cache:          lookupCache,
 	}
-	router := &httpapi.Router{Proxy: proxy}
+	router := &httpapi.Router{
+		Proxy: proxy,
+		Versions: &httpapi.AssetVersionsHandler{
+			DB:             db,
+			AllowedServers: map[string]struct{}{"jp": {}, "en": {}, "tw": {}, "kr": {}, "cn": {}},
+		},
+	}
 	httpSrv := httptest.NewServer(router.Handler())
 	t.Cleanup(httpSrv.Close)
 
@@ -482,6 +489,62 @@ func TestEndToEndSharedThenOverride(t *testing.T) {
 	if code != 404 || missHeaders.Get("X-Miss") != "not-indexed" {
 		t.Fatalf("bare asset path should miss, got code=%d X-Miss=%q", code, missHeaders.Get("X-Miss"))
 	}
+
+	// Version history + per-version update diff, as the frontend consumes them.
+	var versions struct {
+		Items []struct {
+			AssetVersion  string `json:"assetVersion"`
+			AppVersion    string `json:"appVersion"`
+			ChangedAssets int64  `json:"changedAssets"`
+			DiffURL       string `json:"diffUrl"`
+		} `json:"items"`
+	}
+	httpGetJSON(t, fx.httpBase+"/api/assets/versions?server=en", &versions)
+	if len(versions.Items) != 2 ||
+		versions.Items[0].AssetVersion != "6.0.0.2" || versions.Items[1].AssetVersion != "6.0.0.1" {
+		t.Fatalf("en versions wrong: %+v", versions.Items)
+	}
+	if versions.Items[0].ChangedAssets != 1 || versions.Items[1].ChangedAssets != 1 {
+		t.Fatalf("en changedAssets wrong: %+v", versions.Items)
+	}
+
+	type diffResp struct {
+		TotalChanged int64 `json:"totalChanged"`
+		Items        []struct {
+			ChangeType string `json:"changeType"`
+			Path       string `json:"path"`
+			URL        string `json:"url"`
+			Source     string `json:"source"`
+			Size       int64  `json:"size"`
+		} `json:"items"`
+	}
+	// 6.0.0.2 replaced the shared file with an EN override upload.
+	var overrideDiff diffResp
+	httpGetJSON(t, fx.httpBase+versions.Items[0].DiffURL, &overrideDiff)
+	if overrideDiff.TotalChanged != 1 || len(overrideDiff.Items) != 1 {
+		t.Fatalf("override diff wrong: %+v", overrideDiff)
+	}
+	if it := overrideDiff.Items[0]; it.Path != publicPath || it.ChangeType != "updated" ||
+		it.Source != "override" || it.Size != int64(len(body2)) ||
+		it.URL != "/sekai-en-assets/"+publicPath {
+		t.Fatalf("override diff item wrong: %+v", it)
+	}
+	// 6.0.0.1 bound EN to the existing shared bytes without an upload; the
+	// reuse row intentionally carries no size/sha of its own.
+	var reuseDiff diffResp
+	httpGetJSON(t, fx.httpBase+versions.Items[1].DiffURL, &reuseDiff)
+	if reuseDiff.TotalChanged != 1 || len(reuseDiff.Items) != 1 {
+		t.Fatalf("reuse diff wrong: %+v", reuseDiff)
+	}
+	if it := reuseDiff.Items[0]; it.Path != publicPath || it.ChangeType != "added" || it.Source != "shared" {
+		t.Fatalf("reuse diff item wrong: %+v", it)
+	}
+
+	// Unknown version → 404.
+	code, _ = httpGetCode(t, fx.httpBase+"/api/assets/diff?server=en&version=9.9.9.9")
+	if code != 404 {
+		t.Fatalf("unknown version diff: code=%d, want 404", code)
+	}
 }
 
 func TestZeroFileBundleCompletionSkipsAfterRestart(t *testing.T) {
@@ -607,6 +670,14 @@ func httpGet(t *testing.T, url string) ([]byte, http.Header) {
 		t.Fatalf("read body: %v", err)
 	}
 	return body, resp.Header
+}
+
+func httpGetJSON(t *testing.T, url string, out any) {
+	t.Helper()
+	body, _ := httpGet(t, url)
+	if err := json.Unmarshal(body, out); err != nil {
+		t.Fatalf("GET %s: decode json: %v body=%q", url, err, body)
+	}
 }
 
 func httpGetCode(t *testing.T, url string) (int, http.Header) {

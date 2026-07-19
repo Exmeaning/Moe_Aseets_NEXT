@@ -11,12 +11,13 @@ type serverKey struct{}
 type relPathKey struct{}
 
 // Router wires the routes: /healthz, /metrics, /api/assets/browse,
-// /sekai-{server}-assets/*.
+// /api/assets/versions, /api/assets/diff, /sekai-{server}-assets/*.
 type Router struct {
-	Proxy   *ProxyHandler
-	Browser *AssetBrowserHandler
-	Metrics http.Handler // optional
-	Limiter *IPRateLimiter
+	Proxy    *ProxyHandler
+	Browser  *AssetBrowserHandler
+	Versions *AssetVersionsHandler
+	Metrics  http.Handler // optional
+	Limiter  *IPRateLimiter
 }
 
 // Handler returns the top-level http.Handler for the read port.
@@ -33,6 +34,10 @@ func (r *Router) Handler() http.Handler {
 	}
 	if r.Browser != nil {
 		mux.Handle("/api/assets/browse", r.Browser)
+	}
+	if r.Versions != nil {
+		mux.Handle("/api/assets/versions", r.Versions)
+		mux.Handle("/api/assets/diff", r.Versions)
 	}
 
 	proxy := r.Proxy

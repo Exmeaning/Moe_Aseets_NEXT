@@ -20,6 +20,7 @@ CREATE INDEX IF NOT EXISTS idx_assets_path_fp   ON assets(path, fingerprint);
 CREATE INDEX IF NOT EXISTS idx_assets_bundle_fp ON assets(bundle_path, fingerprint);
 CREATE INDEX IF NOT EXISTS idx_assets_sha       ON assets(sha256);
 CREATE INDEX IF NOT EXISTS idx_assets_current   ON assets(server, path);
+CREATE INDEX IF NOT EXISTS idx_assets_server_version ON assets(server, version, path);
 
 CREATE TABLE IF NOT EXISTS current_assets (
     server      TEXT NOT NULL,

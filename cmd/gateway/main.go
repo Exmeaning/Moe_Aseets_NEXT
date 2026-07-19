@@ -115,11 +115,16 @@ func run() error {
 		DB:             db,
 		AllowedServers: cfg.AllowedServers,
 	}
+	versions := &httpapi.AssetVersionsHandler{
+		DB:             db,
+		AllowedServers: cfg.AllowedServers,
+	}
 	router := &httpapi.Router{
-		Proxy:   proxy,
-		Browser: browser,
-		Metrics: reg.Handler(),
-		Limiter: httpapi.NewIPRateLimiter(cfg.HTTPRateLimitRPS, cfg.HTTPRateLimitBurst),
+		Proxy:    proxy,
+		Browser:  browser,
+		Versions: versions,
+		Metrics:  reg.Handler(),
+		Limiter:  httpapi.NewIPRateLimiter(cfg.HTTPRateLimitRPS, cfg.HTTPRateLimitBurst),
 	}
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
