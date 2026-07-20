@@ -20,15 +20,17 @@ const maxAssetVersionLen = 128
 // OR-chain arbitrarily.
 const maxDiffTypes = 16
 
-// defaultDiffTypes keeps the diff payload to the file kinds a frontend
-// actually renders unless the caller opts out with types=all.
-var defaultDiffTypes = []string{"webp", "mp3", "json"}
+// defaultDiffTypes keeps the diff payload to webp and mp3 files by default.
+var defaultDiffTypes = []string{"webp", "mp3"}
+
+// defaultMinMp3Size restricts mp3 files to >= 1MB (1,048,576 bytes) when using default types filter.
+const defaultMinMp3Size int64 = 1 * 1024 * 1024
 
 // AssetVersionsHandler exposes the committed version history and the
 // per-version update diff for the public frontend:
 //
 //	GET /api/assets/versions?server=jp[&limit=][&cursor=]
-//	GET /api/assets/diff?server=jp&version=6.0.0.11[&limit=][&cursor=][&types=]
+//	GET /api/assets/diff?server=jp&version=6.0.0.11[&limit=][&cursor=][&types=][&action=]
 //
 // Both read SQLite on demand (same pattern as the asset browser) and keep a
 // short-lived in-process response cache keyed by asset revision.
@@ -39,8 +41,10 @@ type AssetVersionsHandler struct {
 	MaxLimit       int
 	CacheTTL       time.Duration
 	MaxCacheItems  int
-	// DefaultTypes overrides the built-in webp/mp3/json diff filter.
+	// DefaultTypes overrides the built-in webp/mp3 diff filter.
 	DefaultTypes []string
+	// DefaultMinMp3Size overrides the built-in 1MB mp3 size filter for default types.
+	DefaultMinMp3Size *int64
 
 	mu    sync.Mutex
 	cache map[string]cachedBrowseResponse
@@ -57,7 +61,7 @@ type assetVersionItem struct {
 	AssetVersion  string          `json:"assetVersion"`
 	AppVersion    string          `json:"appVersion"`
 	AssetHash     string          `json:"assetHash,omitempty"`
-	BundleCount   int64           `json:"bundleCount"`
+	BundleCount   int64           `json:"bundleCount,omitempty"`
 	CommittedAt   int64           `json:"committedAt"`
 	ChangedAssets int64           `json:"changedAssets"`
 	Stats         json.RawMessage `json:"stats,omitempty"`
@@ -70,6 +74,7 @@ type assetDiffResponse struct {
 	AppVersion   string          `json:"appVersion"`
 	AssetHash    string          `json:"assetHash,omitempty"`
 	CommittedAt  int64           `json:"committedAt"`
+	Action       string          `json:"action,omitempty"`
 	Types        []string        `json:"types,omitempty"`
 	TotalChanged int64           `json:"totalChanged"`
 	Limit        int             `json:"limit"`
@@ -190,10 +195,24 @@ func (h *AssetVersionsHandler) serveDiff(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "bad limit", http.StatusBadRequest)
 		return
 	}
-	exts, err := parseDiffTypes(q.Get("types"), h.defaultTypes())
+	action, err := parseDiffAction(q.Get("action"))
 	if err != nil {
-		http.Error(w, "bad types", http.StatusBadRequest)
+		http.Error(w, "bad action", http.StatusBadRequest)
 		return
+	}
+	rawTypes := q.Get("types")
+	var exts []string
+	var minMp3Size int64
+	if rawTypes == "" {
+		exts = h.defaultTypes()
+		minMp3Size = h.defaultMinMp3Size()
+	} else {
+		exts, err = parseDiffTypes(rawTypes, h.defaultTypes())
+		if err != nil {
+			http.Error(w, "bad types", http.StatusBadRequest)
+			return
+		}
+		minMp3Size = 0
 	}
 	cursor, err := parseDiffCursor(q.Get("cursor"))
 	if err != nil {
@@ -206,14 +225,20 @@ func (h *AssetVersionsHandler) serveDiff(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "lookup revision", http.StatusInternalServerError)
 		return
 	}
-	cacheKey := fmt.Sprintf("diff\x00%d\x00%s\x00%s\x00%s\x00%d\x00%s\x00%d\x00%t",
-		revision, server, version, strings.Join(exts, ","), limit, cursor.Path, cursor.Size, cursor.Set)
+	cacheKey := fmt.Sprintf("diff\x00%d\x00%s\x00%s\x00%s\x00%s\x00%d\x00%d\x00%s\x00%d\x00%t",
+		revision, server, version, action, strings.Join(exts, ","), minMp3Size, limit, cursor.Path, cursor.Size, cursor.Set)
 	if body, ok := h.getCached(cacheKey); ok {
 		writeBrowseJSON(w, r, body)
 		return
 	}
 
-	diff, found, err := store.DiffVersion(r.Context(), h.DB, server, version, exts, cursor, limit)
+	diff, found, err := store.DiffVersion(r.Context(), h.DB, server, version, store.DiffOptions{
+		Action:     action,
+		Exts:       exts,
+		MinMp3Size: minMp3Size,
+		Cursor:     cursor,
+		Limit:      limit,
+	})
 	if err != nil {
 		http.Error(w, "diff version", http.StatusInternalServerError)
 		return
@@ -228,6 +253,7 @@ func (h *AssetVersionsHandler) serveDiff(w http.ResponseWriter, r *http.Request,
 		AppVersion:   diff.Version.AppVersion,
 		AssetHash:    diff.Version.AssetHash,
 		CommittedAt:  diff.Version.CommittedAt,
+		Action:       action,
 		Types:        exts,
 		TotalChanged: diff.TotalChanged,
 		Limit:        limit,
@@ -361,12 +387,38 @@ func parseVersionsCursor(raw string) (int64, error) {
 	return id, nil
 }
 
+// parseDiffAction validates the ?action= query parameter.
+// Allowed values: "added" (default), "updated" (or "replaced"), "all".
+func parseDiffAction(raw string) (string, error) {
+	if raw == "" {
+		return "added", nil
+	}
+	switch strings.ToLower(raw) {
+	case "added":
+		return "added", nil
+	case "updated", "replaced":
+		return "updated", nil
+	case "all":
+		return "all", nil
+	default:
+		return "", fmt.Errorf("bad action")
+	}
+}
+
 func (h *AssetVersionsHandler) defaultTypes() []string {
 	if h.DefaultTypes != nil {
 		return h.DefaultTypes
 	}
 	return defaultDiffTypes
 }
+
+func (h *AssetVersionsHandler) defaultMinMp3Size() int64 {
+	if h.DefaultMinMp3Size != nil {
+		return *h.DefaultMinMp3Size
+	}
+	return defaultMinMp3Size
+}
+
 
 func (h *AssetVersionsHandler) defaultLimit() int {
 	if h.DefaultLimit > 0 {

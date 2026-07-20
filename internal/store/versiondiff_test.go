@@ -96,7 +96,10 @@ func TestDiffVersionSizeOrderAndChangeType(t *testing.T) {
 	db := openMem(t)
 	seedDiffFixture(t, db)
 
-	diff, found, err := DiffVersion(context.Background(), db, "jp", "v2", nil, DiffCursor{}, 10)
+	diff, found, err := DiffVersion(context.Background(), db, "jp", "v2", DiffOptions{
+		Action: "all",
+		Limit:  10,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +135,11 @@ func TestDiffVersionKeysetPaginationAcrossEqualSizes(t *testing.T) {
 	var got []string
 	cursor := DiffCursor{}
 	for i := 0; i < 4; i++ {
-		diff, found, err := DiffVersion(context.Background(), db, "jp", "v2", nil, cursor, 1)
+		diff, found, err := DiffVersion(context.Background(), db, "jp", "v2", DiffOptions{
+			Action: "all",
+			Cursor: cursor,
+			Limit:  1,
+		})
 		if err != nil || !found {
 			t.Fatalf("page %d: found=%v err=%v", i, found, err)
 		}
@@ -155,11 +162,16 @@ func TestDiffVersionKeysetPaginationAcrossEqualSizes(t *testing.T) {
 	}
 }
 
-func TestDiffVersionExtensionFilter(t *testing.T) {
+func TestDiffVersionExtensionFilterAndActionDefaults(t *testing.T) {
 	db := openMem(t)
 	seedDiffFixture(t, db)
 
-	diff, found, err := DiffVersion(context.Background(), db, "jp", "v1", []string{"webp", "mp3", "json"}, DiffCursor{}, 10)
+	// Action added (default) with exts filter (webp, mp3, json)
+	diff, found, err := DiffVersion(context.Background(), db, "jp", "v1", DiffOptions{
+		Action: "added",
+		Exts:   []string{"webp", "mp3", "json"},
+		Limit:  10,
+	})
 	if err != nil || !found {
 		t.Fatalf("found=%v err=%v", found, err)
 	}
@@ -173,7 +185,11 @@ func TestDiffVersionExtensionFilter(t *testing.T) {
 		}
 	}
 
-	only, _, err := DiffVersion(context.Background(), db, "jp", "v1", []string{"webp"}, DiffCursor{}, 10)
+	only, _, err := DiffVersion(context.Background(), db, "jp", "v1", DiffOptions{
+		Action: "added",
+		Exts:   []string{"webp"},
+		Limit:  10,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,18 +199,76 @@ func TestDiffVersionExtensionFilter(t *testing.T) {
 	}
 }
 
+func TestDiffVersionMinMp3SizeAndActionFilter(t *testing.T) {
+	db := openMem(t)
+	// Add a 2MB mp3 to v1
+	insert(t, db, Asset{Server: "jp", BundlePath: "snd", Path: "snd/large.mp3", Version: "v1", Fingerprint: "fl", Sha256: "sl", Size: 2000000, StorageKey: "/shared-assets/snd/large.mp3"})
+	seedDiffFixture(t, db)
+
+	// v1: a.webp(100), d.webp(200), b.mp3(300), c.acb(999), large.mp3(2000000) - all added.
+	// Filter with default types (webp, mp3) and MinMp3Size = 1MB (1048576).
+	diff, found, err := DiffVersion(context.Background(), db, "jp", "v1", DiffOptions{
+		Action:     "added",
+		Exts:       []string{"webp", "mp3"},
+		MinMp3Size: 1048576,
+		Limit:      10,
+	})
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	// large.mp3(2000000), d.webp(200), a.webp(100) match. b.mp3(300 < 1MB) and c.acb are excluded.
+	if diff.TotalChanged != 3 || len(diff.Items) != 3 {
+		t.Fatalf("TotalChanged=%d items=%d, want 3/3: %+v", diff.TotalChanged, len(diff.Items), diff.Items)
+	}
+	if diff.Items[0].Path != "snd/large.mp3" || diff.Items[1].Path != "img/d.webp" || diff.Items[2].Path != "img/a.webp" {
+		t.Fatalf("unexpected items: %+v", diff.Items)
+	}
+
+	// v2: b.mp3(500, updated), e.json(500, added), g.webp(10, added)
+	// Default action ("added"): b.mp3 is excluded (it's updated).
+	addedOnly, _, err := DiffVersion(context.Background(), db, "jp", "v2", DiffOptions{
+		Action: "added",
+		Exts:   []string{"webp", "mp3", "json"},
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addedOnly.TotalChanged != 2 || len(addedOnly.Items) != 2 {
+		t.Fatalf("addedOnly TotalChanged=%d items=%d, want 2/2", addedOnly.TotalChanged, len(addedOnly.Items))
+	}
+	for _, it := range addedOnly.Items {
+		if it.Path == "snd/b.mp3" {
+			t.Fatalf("b.mp3 is updated and should be excluded in added filter: %+v", addedOnly.Items)
+		}
+	}
+
+	// Action "updated": only b.mp3 is returned.
+	updatedOnly, _, err := DiffVersion(context.Background(), db, "jp", "v2", DiffOptions{
+		Action: "updated",
+		Exts:   []string{"webp", "mp3", "json"},
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedOnly.TotalChanged != 1 || len(updatedOnly.Items) != 1 || updatedOnly.Items[0].Path != "snd/b.mp3" {
+		t.Fatalf("updatedOnly wrong: %+v", updatedOnly)
+	}
+}
+
 func TestDiffVersionUnknownVersion(t *testing.T) {
 	db := openMem(t)
 	seedDiffFixture(t, db)
 
-	_, found, err := DiffVersion(context.Background(), db, "jp", "nope", nil, DiffCursor{}, 10)
+	_, found, err := DiffVersion(context.Background(), db, "jp", "nope", DiffOptions{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if found {
 		t.Fatal("unknown version must report found=false")
 	}
-	_, found, err = DiffVersion(context.Background(), db, "en", "v1", nil, DiffCursor{}, 10)
+	_, found, err = DiffVersion(context.Background(), db, "en", "v1", DiffOptions{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,3 +276,4 @@ func TestDiffVersionUnknownVersion(t *testing.T) {
 		t.Fatal("version committed by jp must not be visible for en")
 	}
 }
+

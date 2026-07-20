@@ -128,16 +128,29 @@ type VersionDiff struct {
 	NextCursor   DiffCursor
 }
 
+// DiffOptions defines filters and pagination parameters for DiffVersion.
+type DiffOptions struct {
+	// Action filters by change type: "added" (default, Existed==false),
+	// "updated" (Existed==true), or "all" (both).
+	Action string
+	// Exts, when non-empty, keeps only paths matching the specified extension suffixes.
+	Exts []string
+	// MinMp3Size, when > 0, restricts ".mp3" files to size >= MinMp3Size.
+	MinMp3Size int64
+	Cursor     DiffCursor
+	Limit      int
+}
+
 // DiffVersion returns the files added/updated by (server, assetVersion),
 // largest first (path breaks ties so pages are stable), resuming after
-// cursor. exts, when non-empty, keeps only paths ending in ".<ext>"; tokens
-// must already be validated to [a-z0-9]+ by the caller. TotalChanged counts
-// with the same filter applied so pagination maths stay consistent.
+// cursor. Filter options in opts control change type, extension whitelist,
+// and minimum size constraints. TotalChanged counts with the same filters
+// applied so pagination maths stay consistent.
 // found=false means no such version was ever committed. Deletions never
 // happen in this store, so a diff is only ever additions and content updates.
-func DiffVersion(ctx context.Context, db *sql.DB, server, assetVersion string, exts []string, cursor DiffCursor, limit int) (VersionDiff, bool, error) {
+func DiffVersion(ctx context.Context, db *sql.DB, server, assetVersion string, opts DiffOptions) (VersionDiff, bool, error) {
 	var out VersionDiff
-	if limit <= 0 {
+	if opts.Limit <= 0 {
 		return out, false, nil
 	}
 	// A re-commit of the same asset_version with a different asset_hash upserts
@@ -162,28 +175,29 @@ func DiffVersion(ctx context.Context, db *sql.DB, server, assetVersion string, e
 	// Both queries narrow through idx_assets_server_version first; the LIKE
 	// suffix filter and the size sort then only touch this version's delta
 	// rows, which stay small compared to the whole assets table.
-	extCond, extArgs := extSuffixCondition(exts)
+	actCond := actionCondition(opts.Action)
+	extCond, extArgs := extSuffixCondition(opts.Exts, opts.MinMp3Size)
 
 	countArgs := append([]any{server, assetVersion}, extArgs...)
 	if err := db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM assets a
-		WHERE a.server=? AND a.version=? AND a.path<>''`+extCond,
+		WHERE a.server=? AND a.version=? AND a.path<>''`+actCond+extCond,
 		countArgs...).Scan(&out.TotalChanged); err != nil {
 		return out, false, err
 	}
 
 	pageCond := ""
 	pageArgs := append([]any{server, assetVersion}, extArgs...)
-	if cursor.Set {
+	if opts.Cursor.Set {
 		pageCond = ` AND (a.size<? OR (a.size=? AND a.path>?))`
-		pageArgs = append(pageArgs, cursor.Size, cursor.Size, cursor.Path)
+		pageArgs = append(pageArgs, opts.Cursor.Size, opts.Cursor.Size, opts.Cursor.Path)
 	}
-	pageArgs = append(pageArgs, limit+1)
+	pageArgs = append(pageArgs, opts.Limit+1)
 	rows, err := db.QueryContext(ctx, `
 		SELECT a.path, a.bundle_path, a.fingerprint, a.sha256, a.size, a.is_override,
 		       EXISTS(SELECT 1 FROM assets p WHERE p.server=a.server AND p.path=a.path AND p.id<a.id)
 		FROM assets a
-		WHERE a.server=? AND a.version=? AND a.path<>''`+extCond+pageCond+`
+		WHERE a.server=? AND a.version=? AND a.path<>''`+actCond+extCond+pageCond+`
 		ORDER BY a.size DESC, a.path ASC
 		LIMIT ?
 	`, pageArgs...)
@@ -206,25 +220,45 @@ func DiffVersion(ctx context.Context, db *sql.DB, server, assetVersion string, e
 	if err := rows.Err(); err != nil {
 		return out, false, err
 	}
-	if len(out.Items) > limit {
-		out.Items = out.Items[:limit]
-		last := out.Items[limit-1]
+	if len(out.Items) > opts.Limit {
+		out.Items = out.Items[:opts.Limit]
+		last := out.Items[opts.Limit-1]
 		out.NextCursor = DiffCursor{Size: last.Size, Path: last.Path, Set: true}
 	}
 	return out, true, nil
 }
 
+func actionCondition(action string) string {
+	switch strings.ToLower(action) {
+	case "updated", "replaced":
+		return " AND EXISTS(SELECT 1 FROM assets p WHERE p.server=a.server AND p.path=a.path AND p.id<a.id)"
+	case "all":
+		return ""
+	case "added", "":
+		fallthrough
+	default:
+		return " AND NOT EXISTS(SELECT 1 FROM assets p WHERE p.server=a.server AND p.path=a.path AND p.id<a.id)"
+	}
+}
+
 // extSuffixCondition builds "AND (a.path LIKE '%.webp' OR ...)" for validated
 // extension tokens. Tokens are [a-z0-9]+ so no LIKE metacharacters can leak.
-func extSuffixCondition(exts []string) (string, []any) {
+// If minMp3Size > 0, .mp3 extension checks additionally require a.size >= minMp3Size.
+func extSuffixCondition(exts []string, minMp3Size int64) (string, []any) {
 	if len(exts) == 0 {
 		return "", nil
 	}
 	parts := make([]string, 0, len(exts))
-	args := make([]any, 0, len(exts))
+	args := make([]any, 0, len(exts)*2)
 	for _, ext := range exts {
-		parts = append(parts, "a.path LIKE ?")
-		args = append(args, "%."+ext)
+		if ext == "mp3" && minMp3Size > 0 {
+			parts = append(parts, "(a.path LIKE ? AND a.size >= ?)")
+			args = append(args, "%."+ext, minMp3Size)
+		} else {
+			parts = append(parts, "a.path LIKE ?")
+			args = append(args, "%."+ext)
+		}
 	}
 	return " AND (" + strings.Join(parts, " OR ") + ")", args
 }
+

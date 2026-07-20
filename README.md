@@ -203,7 +203,6 @@ curl 'http://localhost:8080/api/assets/diff?server=jp&version=6.0.0.11&limit=100
       "assetVersion": "6.0.0.11",
       "appVersion": "6.0.0",
       "assetHash": "abcd...",
-      "bundleCount": 4096,
       "committedAt": 1751234567,
       "changedAssets": 1234,
       "stats": {"skipped_by_layer1": 100, "uploaded_shared": 34},
@@ -222,7 +221,8 @@ curl 'http://localhost:8080/api/assets/diff?server=jp&version=6.0.0.11&limit=100
 |---|---:|---|---|
 | `server` | yes | - | One of the configured server tokens. |
 | `version` | yes | - | An `assetVersion` from the versions endpoint. Unknown → `404`. |
-| `types` | no | `webp,mp3,json` | Comma-separated extension whitelist to keep payloads small. `types=all` disables filtering. Tokens are `[a-z0-9]`, max 16. |
+| `action` | no | `added` | Change type filter: `added` (new files only), `updated` (replaced files only), or `all` (both). |
+| `types` | no | `webp,mp3` | Comma-separated extension whitelist. By default, includes `.webp` and `.mp3` files $\ge$ 1MB (`1048576` bytes). `types=all` disables extension/size filtering. Tokens are `[a-z0-9]`, max 16. |
 | `limit` | no | `100` | Page size, capped at `200`. |
 | `cursor` | no | - | Opaque `size:path` cursor from `nextCursor`. URL-encode it. |
 
@@ -233,13 +233,14 @@ curl 'http://localhost:8080/api/assets/diff?server=jp&version=6.0.0.11&limit=100
   "appVersion": "6.0.0",
   "assetHash": "abcd...",
   "committedAt": 1751234567,
-  "types": ["webp", "mp3", "json"],
+  "action": "added",
+  "types": ["webp", "mp3"],
   "totalChanged": 890,
   "limit": 100,
   "nextCursor": "52341:event/foo/bg.webp",
   "items": [
     {
-      "changeType": "updated",
+      "changeType": "added",
       "path": "event/foo/bg.webp",
       "url": "/sekai-jp-assets/event/foo/bg.webp",
       "source": "shared",
@@ -254,14 +255,10 @@ curl 'http://localhost:8080/api/assets/diff?server=jp&version=6.0.0.11&limit=100
 
 Semantics & operational constraints:
 
-- The diff of a version is exactly the asset rows its COMMIT minted: files the
-  region gained (`changeType: "added"`) or whose content changed
-  (`changeType: "updated"`). Files skipped because the region already had the
-  identical bytes produce no row. The store never deletes, so there is no
-  "removed" change type.
+- By default, the diff of a version returns only newly added files (`changeType: "added"`, `action=added`) and restricts types to `.webp` and `.mp3` files $\ge$ 1MB. Use `action=all` or `action=updated` and `types=all` to override filters.
 - Items are ordered largest-first (`size DESC`, `path ASC` for ties), so one
   page is enough to show a version's heaviest additions.
-- `totalChanged` is computed with the active `types` filter applied, so it
+- `totalChanged` is computed with the active `action` and `types` filters applied, so it
   always matches what pagination will eventually return.
 - Cross-region reuse rows (a region adopting already-uploaded shared bytes)
   report `size: 0` and no `sha256` — no bytes travelled for them.

@@ -26,7 +26,7 @@ func insertVersionRow(t *testing.T, db *sql.DB, v store.Version) {
 }
 
 // seedVersionsDB commits jp v1 (a.webp/100, c.acb/999) then jp v2
-// (a.webp/300 updated, b.mp3/500 added).
+// (a.webp/300 updated, b.mp3/1500000 added).
 func seedVersionsDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := store.Open(":memory:")
@@ -40,7 +40,7 @@ func seedVersionsDB(t *testing.T) *sql.DB {
 	insertVersionRow(t, db, store.Version{Server: "jp", AppVersion: "1.0", AssetVersion: "v1", AssetHash: "h1", BundleCount: 2, StatsJSON: `{"uploaded_shared":2}`})
 
 	insertBrowserAsset(t, db, store.Asset{Server: "jp", BundlePath: "img", Path: "img/a.webp", Version: "v2", Fingerprint: "fa2", Sha256: "sa2", Size: 300, StorageKey: "/shared-assets/img/a.webp"})
-	insertBrowserAsset(t, db, store.Asset{Server: "jp", BundlePath: "snd", Path: "snd/b.mp3", Version: "v2", Fingerprint: "fb", Sha256: "sb", Size: 500, StorageKey: "/shared-assets/snd/b.mp3"})
+	insertBrowserAsset(t, db, store.Asset{Server: "jp", BundlePath: "snd", Path: "snd/b.mp3", Version: "v2", Fingerprint: "fb", Sha256: "sb", Size: 1500000, StorageKey: "/shared-assets/snd/b.mp3"})
 	insertVersionRow(t, db, store.Version{Server: "jp", AppVersion: "1.1", AssetVersion: "v2", AssetHash: "h2", BundleCount: 2, StatsJSON: `{"uploaded_shared":2}`})
 	return db
 }
@@ -106,7 +106,7 @@ func TestAssetDiffHandlerSizeOrderTypesAndCursor(t *testing.T) {
 	db := seedVersionsDB(t)
 	h := newVersionsHandler(db)
 
-	// Default types (webp,mp3,json): v1's c.acb is hidden.
+	// Default types (webp, mp3>=1M) and default action (added): v1's c.acb is hidden.
 	var v1 assetDiffResponse
 	rr := getJSON(t, h, "/api/assets/diff?server=jp&version=v1", &v1)
 	if rr.Code != http.StatusOK {
@@ -130,17 +130,28 @@ func TestAssetDiffHandlerSizeOrderTypesAndCursor(t *testing.T) {
 		t.Fatalf("types=all should omit types echo: %+v", all.Types)
 	}
 
-	// v2: size desc → b.mp3(500, added) then a.webp(300, updated); walk limit=1.
+	// v2 default: action=added (default), webp + mp3>=1M.
+	// b.mp3 is 1.5MB added, a.webp is updated (so excluded by default action).
+	var v2Default assetDiffResponse
+	rr = getJSON(t, h, "/api/assets/diff?server=jp&version=v2", &v2Default)
+	if rr.Code != http.StatusOK || v2Default.TotalChanged != 1 || len(v2Default.Items) != 1 || v2Default.Items[0].Path != "snd/b.mp3" {
+		t.Fatalf("v2 default diff wrong: %+v", v2Default)
+	}
+	if v2Default.Action != "added" {
+		t.Fatalf("v2 default action echo wrong: %q", v2Default.Action)
+	}
+
+	// v2 with action=all & types=all: size desc → b.mp3(1500000, added) then a.webp(300, updated); walk limit=1.
 	var page assetDiffResponse
-	rr = getJSON(t, h, "/api/assets/diff?server=jp&version=v2&limit=1", &page)
+	rr = getJSON(t, h, "/api/assets/diff?server=jp&version=v2&action=all&types=all&limit=1", &page)
 	if rr.Code != http.StatusOK || page.TotalChanged != 2 || len(page.Items) != 1 {
 		t.Fatalf("bad v2 page1: %d %+v", rr.Code, page)
 	}
-	if page.Items[0].Path != "snd/b.mp3" || page.Items[0].ChangeType != "added" || page.NextCursor != "500:snd/b.mp3" {
+	if page.Items[0].Path != "snd/b.mp3" || page.Items[0].ChangeType != "added" || page.NextCursor != "1500000:snd/b.mp3" {
 		t.Fatalf("bad v2 page1 item: %+v", page)
 	}
 	var page2 assetDiffResponse
-	rr = getJSON(t, h, "/api/assets/diff?server=jp&version=v2&limit=1&cursor=500%3Asnd%2Fb.mp3", &page2)
+	rr = getJSON(t, h, "/api/assets/diff?server=jp&version=v2&action=all&types=all&limit=1&cursor=1500000%3Asnd%2Fb.mp3", &page2)
 	if rr.Code != http.StatusOK || len(page2.Items) != 1 ||
 		page2.Items[0].Path != "img/a.webp" || page2.Items[0].ChangeType != "updated" {
 		t.Fatalf("bad v2 page2: %d %+v", rr.Code, page2)
@@ -166,6 +177,7 @@ func TestAssetVersionsHandlerRejectsBadInput(t *testing.T) {
 		"/api/assets/diff?server=jp&version=v1&cursor=5:/abs", // absolute cursor path
 		"/api/assets/diff?server=jp&version=v1&types=w!p",     // bad type token
 		"/api/assets/diff?server=jp&version=v1&types=a,,b",    // empty type token
+		"/api/assets/diff?server=jp&version=v1&action=bogus",  // bad action
 	}
 	for _, target := range badRequests {
 		if rr := getJSON(t, h, target, nil); rr.Code != http.StatusBadRequest {

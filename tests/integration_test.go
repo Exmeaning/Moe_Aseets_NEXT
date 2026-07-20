@@ -519,8 +519,14 @@ func TestEndToEndSharedThenOverride(t *testing.T) {
 		} `json:"items"`
 	}
 	// 6.0.0.2 replaced the shared file with an EN override upload.
+	// Default diff returns 0 items because default action is "added".
+	var defaultOverrideDiff diffResp
+	httpGetJSON(t, fx.httpBase+versions.Items[0].DiffURL, &defaultOverrideDiff)
+	if defaultOverrideDiff.TotalChanged != 0 || len(defaultOverrideDiff.Items) != 0 {
+		t.Fatalf("default override diff should be empty, got: %+v", defaultOverrideDiff)
+	}
 	var overrideDiff diffResp
-	httpGetJSON(t, fx.httpBase+versions.Items[0].DiffURL, &overrideDiff)
+	httpGetJSON(t, fx.httpBase+versions.Items[0].DiffURL+"&action=updated", &overrideDiff)
 	if overrideDiff.TotalChanged != 1 || len(overrideDiff.Items) != 1 {
 		t.Fatalf("override diff wrong: %+v", overrideDiff)
 	}

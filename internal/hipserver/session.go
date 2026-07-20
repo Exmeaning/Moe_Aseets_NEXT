@@ -802,7 +802,7 @@ func (s *session) handleCommit(ctx context.Context, payload []byte) error {
 		AppVersion:   s.hello.AppVersion,
 		AssetVersion: s.hello.AssetVersion,
 		AssetHash:    s.hello.AssetHash,
-		BundleCount:  int64(c.BundleCount),
+		BundleCount:  0,
 		StatsJSON:    string(statsBytes),
 	})
 	if err != nil {
