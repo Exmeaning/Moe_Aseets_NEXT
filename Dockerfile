@@ -3,8 +3,13 @@
 # Build & runtime image for moe-assets-gateway.
 #
 # Notes
-#   - CGO_ENABLED=0: modernc.org/sqlite is pure Go, so we ship a fully static
-#     binary in a distroless image. No libc needed at runtime.
+#   - CGO_ENABLED=1: the SQLite driver is mattn/go-sqlite3 (C SQLite), several
+#     times faster than the pure-Go driver on scan-heavy queries. The binary
+#     is statically linked against musl so the distroless/static runtime image
+#     still works without a libc.
+#   - cgo cannot cross-compile without a per-target C toolchain, so the build
+#     stage runs natively on each platform (BuildKit emulates foreign arches)
+#     instead of the --platform=$BUILDPLATFORM trick.
 #   - BuildKit cache mounts (`--mount=type=cache`) speed up rebuilds; they
 #     require BuildKit which is the default on Docker >= 23.
 #   - The final image runs as `nonroot` (UID/GID 65532) from distroless. The
@@ -21,11 +26,11 @@
 # --------------------------------------------------------------------
 # Stage 1: build
 # --------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+FROM golang:1.25-alpine AS build
 
-# Cross-compile args populated by BuildKit for multi-arch builds.
-ARG TARGETOS
-ARG TARGETARCH
+# C toolchain for mattn/go-sqlite3.
+RUN apk add --no-cache build-base
+
 # Optional version stamp; pass with --build-arg VERSION=$(git rev-parse --short HEAD).
 ARG VERSION=dev
 
@@ -40,14 +45,17 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Copy the rest of the source.
 COPY . .
 
-# Build the static binary. `-trimpath` gives reproducible paths;
-# `-ldflags "-s -w"` strips the DWARF/symbol tables (~30% smaller).
+# Build a statically linked binary (musl): distroless/static has no libc.
+# `sqlite_omit_load_extension` drops the dlopen dependency static linking
+# cannot satisfy; `-trimpath` gives reproducible paths; `-ldflags "-s -w"`
+# strips the DWARF/symbol tables (~30% smaller).
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    CGO_ENABLED=1 \
     go build \
         -trimpath \
-        -ldflags "-s -w -X main.version=${VERSION}" \
+        -tags "osusergo,netgo,sqlite_omit_load_extension" \
+        -ldflags '-s -w -extldflags "-static" -X main.version='"${VERSION}" \
         -o /out/gateway \
         ./cmd/gateway
 

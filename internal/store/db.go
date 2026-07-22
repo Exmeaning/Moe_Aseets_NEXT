@@ -7,16 +7,30 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync/atomic"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
+// memDBSeq gives each Open(":memory:") its own named shared-cache memory DB.
+var memDBSeq atomic.Uint64
+
 // Open opens (and migrates) a SQLite DB at path. The DSN sets busy_timeout
-// and WAL mode. Set path to ":memory:" for tests.
+// and WAL mode. Set path to ":memory:" for tests. mattn/go-sqlite3 requires
+// CGO_ENABLED=1 (the pure-Go modernc driver it replaced was several times
+// slower on scan-heavy queries).
 func Open(path string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(on)&_time_format=sqlite", path)
-	db, err := sql.Open("sqlite", dsn)
+	dsn := fmt.Sprintf("file:%s?_busy_timeout=5000&_journal_mode=WAL&_synchronous=NORMAL&_foreign_keys=on", path)
+	if path == ":memory:" {
+		// database/sql pools several connections, so the memory DB must use a
+		// shared cache or every connection would see its own empty database —
+		// but a *named* one, otherwise all Open(":memory:") calls in the
+		// process (e.g. every test) would share a single database. WAL does
+		// not apply in memory, so it is omitted.
+		dsn = fmt.Sprintf("file:memdb%d?mode=memory&cache=shared&_busy_timeout=5000&_foreign_keys=on", memDBSeq.Add(1))
+	}
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
