@@ -277,3 +277,47 @@ func TestDiffVersionUnknownVersion(t *testing.T) {
 	}
 }
 
+func TestDiffVersionBundlesAndBundleFiles(t *testing.T) {
+	db := openMem(t)
+	v1ID, _ := seedDiffFixture(t, db)
+
+	// Add bundle_completions for v1
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertBundleCompletion(context.Background(), tx, BundleCompletion{
+		VersionID: v1ID, Server: "jp", AssetVersion: "v1", AssetHash: "h1", BundlePath: "img", Fingerprint: "f1", Source: "uploaded",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertBundleCompletion(context.Background(), tx, BundleCompletion{
+		VersionID: v1ID, Server: "jp", AssetVersion: "v1", AssetHash: "h1", BundlePath: "snd", Fingerprint: "f2", Source: "uploaded",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	bDiff, found, err := DiffVersionBundles(context.Background(), db, "jp", "v1", DiffBundleOptions{Limit: 10})
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if bDiff.TotalChanged != 2 || len(bDiff.Items) != 2 {
+		t.Fatalf("v1 totalChanged=%d items=%d, want 2/2: %+v", bDiff.TotalChanged, len(bDiff.Items), bDiff.Items)
+	}
+	if bDiff.Items[0].BundlePath != "img" || bDiff.Items[1].BundlePath != "snd" {
+		t.Fatalf("unexpected bundle paths: %+v", bDiff.Items)
+	}
+
+	fDiff, found, err := DiffBundleFiles(context.Background(), db, "jp", "v1", "img", DiffOptions{Limit: 10})
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if fDiff.TotalChanged != 2 || len(fDiff.Items) != 2 {
+		t.Fatalf("bundle img totalChanged=%d items=%d, want 2/2: %+v", fDiff.TotalChanged, len(fDiff.Items), fDiff.Items)
+	}
+}
+
+

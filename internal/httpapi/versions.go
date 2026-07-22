@@ -66,6 +66,7 @@ type assetVersionItem struct {
 	ChangedAssets int64           `json:"changedAssets"`
 	Stats         json.RawMessage `json:"stats,omitempty"`
 	DiffURL       string          `json:"diffUrl"`
+	BundleDiffURL string          `json:"bundleDiffUrl,omitempty"`
 }
 
 type assetDiffResponse struct {
@@ -76,6 +77,39 @@ type assetDiffResponse struct {
 	CommittedAt  int64           `json:"committedAt"`
 	Action       string          `json:"action,omitempty"`
 	Types        []string        `json:"types,omitempty"`
+	TotalChanged int64           `json:"totalChanged"`
+	Limit        int             `json:"limit"`
+	NextCursor   string          `json:"nextCursor,omitempty"`
+	Items        []assetDiffItem `json:"items"`
+}
+
+type bundleDiffsResponse struct {
+	Server       string           `json:"server"`
+	AssetVersion string           `json:"assetVersion"`
+	AppVersion   string           `json:"appVersion"`
+	AssetHash    string           `json:"assetHash,omitempty"`
+	CommittedAt  int64            `json:"committedAt"`
+	Prefix       string           `json:"prefix,omitempty"`
+	TotalBundles int64            `json:"totalBundles"`
+	Limit        int              `json:"limit"`
+	NextCursor   string           `json:"nextCursor,omitempty"`
+	Items        []bundleDiffItem `json:"items"`
+}
+
+type bundleDiffItem struct {
+	BundlePath  string `json:"bundlePath"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	FileCount   int64  `json:"fileCount"`
+	TotalSize   int64  `json:"totalSize"`
+	Source      string `json:"source,omitempty"`
+	FilesURL    string `json:"filesUrl,omitempty"`
+}
+
+type bundleDiffFilesResponse struct {
+	Server       string          `json:"server"`
+	AssetVersion string          `json:"assetVersion"`
+	AppVersion   string          `json:"appVersion"`
+	BundlePath   string          `json:"bundlePath"`
 	TotalChanged int64           `json:"totalChanged"`
 	Limit        int             `json:"limit"`
 	NextCursor   string          `json:"nextCursor,omitempty"`
@@ -114,6 +148,14 @@ func (h *AssetVersionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if strings.HasSuffix(r.URL.Path, "/bundle-diffs") {
+		h.serveBundleDiffs(w, r, server)
+		return
+	}
+	if strings.HasSuffix(r.URL.Path, "/bundle-diff-files") {
+		h.serveBundleDiffFiles(w, r, server)
+		return
+	}
 	if strings.HasSuffix(r.URL.Path, "/diff") {
 		h.serveDiff(w, r, server)
 		return
@@ -167,11 +209,182 @@ func (h *AssetVersionsHandler) serveVersions(w http.ResponseWriter, r *http.Requ
 			CommittedAt:   v.CommittedAt,
 			ChangedAssets: v.ChangedAssets,
 			DiffURL:       "/api/assets/diff?server=" + url.QueryEscape(server) + "&version=" + url.QueryEscape(v.AssetVersion),
+			BundleDiffURL: "/api/assets/bundle-diffs?server=" + url.QueryEscape(server) + "&version=" + url.QueryEscape(v.AssetVersion),
 		}
 		if stats := strings.TrimSpace(v.StatsJSON); stats != "" && json.Valid([]byte(stats)) {
 			item.Stats = json.RawMessage(stats)
 		}
 		resp.Items = append(resp.Items, item)
+	}
+
+	body, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, "encode response", http.StatusInternalServerError)
+		return
+	}
+	h.setCached(cacheKey, body)
+	writeBrowseJSON(w, r, body)
+}
+
+func (h *AssetVersionsHandler) serveBundleDiffs(w http.ResponseWriter, r *http.Request, server string) {
+	q := r.URL.Query()
+	version, err := normalizeAssetVersion(q.Get("version"))
+	if err != nil {
+		http.Error(w, "bad version", http.StatusBadRequest)
+		return
+	}
+	limit, err := parseBrowseLimit(q.Get("limit"), h.defaultLimit(), h.maxLimit())
+	if err != nil {
+		http.Error(w, "bad limit", http.StatusBadRequest)
+		return
+	}
+	prefix, err := normalizeBrowsePrefix(q.Get("prefix"))
+	if err != nil {
+		http.Error(w, "bad prefix", http.StatusBadRequest)
+		return
+	}
+	cursor, err := normalizeBrowseCursor(q.Get("cursor"), prefix)
+	if err != nil {
+		http.Error(w, "bad cursor", http.StatusBadRequest)
+		return
+	}
+
+	revision, err := store.LatestAssetID(r.Context(), h.DB)
+	if err != nil {
+		http.Error(w, "lookup revision", http.StatusInternalServerError)
+		return
+	}
+	cacheKey := fmt.Sprintf("bundle-diffs\x00%d\x00%s\x00%s\x00%s\x00%s\x00%d", revision, server, version, prefix, cursor, limit)
+	if body, ok := h.getCached(cacheKey); ok {
+		writeBrowseJSON(w, r, body)
+		return
+	}
+
+	diff, found, err := store.DiffVersionBundles(r.Context(), h.DB, server, version, store.DiffBundleOptions{
+		Prefix: prefix,
+		Cursor: cursor,
+		Limit:  limit,
+	})
+	if err != nil {
+		http.Error(w, "diff version bundles", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+
+	resp := bundleDiffsResponse{
+		Server:       server,
+		AssetVersion: diff.Version.AssetVersion,
+		AppVersion:   diff.Version.AppVersion,
+		AssetHash:    diff.Version.AssetHash,
+		CommittedAt:  diff.Version.CommittedAt,
+		Prefix:       prefix,
+		TotalBundles: diff.TotalChanged,
+		Limit:        limit,
+		NextCursor:   diff.NextCursor,
+		Items:        make([]bundleDiffItem, 0, len(diff.Items)),
+	}
+	for _, e := range diff.Items {
+		filesURL := "/api/assets/bundle-diff-files?server=" + url.QueryEscape(server) +
+			"&version=" + url.QueryEscape(version) +
+			"&path=" + url.QueryEscape(e.BundlePath)
+		resp.Items = append(resp.Items, bundleDiffItem{
+			BundlePath:  e.BundlePath,
+			Fingerprint: e.Fingerprint,
+			FileCount:   e.FileCount,
+			TotalSize:   e.TotalSize,
+			Source:      e.Source,
+			FilesURL:    filesURL,
+		})
+	}
+
+	body, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, "encode response", http.StatusInternalServerError)
+		return
+	}
+	h.setCached(cacheKey, body)
+	writeBrowseJSON(w, r, body)
+}
+
+func (h *AssetVersionsHandler) serveBundleDiffFiles(w http.ResponseWriter, r *http.Request, server string) {
+	q := r.URL.Query()
+	version, err := normalizeAssetVersion(q.Get("version"))
+	if err != nil {
+		http.Error(w, "bad version", http.StatusBadRequest)
+		return
+	}
+	bundlePath := strings.TrimPrefix(q.Get("path"), "/")
+	if bundlePath == "" {
+		http.Error(w, "path is required", http.StatusBadRequest)
+		return
+	}
+	limit, err := parseBrowseLimit(q.Get("limit"), h.defaultLimit(), h.maxLimit())
+	if err != nil {
+		http.Error(w, "bad limit", http.StatusBadRequest)
+		return
+	}
+	action, err := parseDiffAction(q.Get("action"))
+	if err != nil {
+		http.Error(w, "bad action", http.StatusBadRequest)
+		return
+	}
+	rawTypes := q.Get("types")
+	var exts []string
+	if rawTypes != "" {
+		exts, err = parseDiffTypes(rawTypes, nil)
+		if err != nil {
+			http.Error(w, "bad types", http.StatusBadRequest)
+			return
+		}
+	}
+	cursor, err := parseDiffCursor(q.Get("cursor"))
+	if err != nil {
+		http.Error(w, "bad cursor", http.StatusBadRequest)
+		return
+	}
+
+	revision, err := store.LatestAssetID(r.Context(), h.DB)
+	if err != nil {
+		http.Error(w, "lookup revision", http.StatusInternalServerError)
+		return
+	}
+	cacheKey := fmt.Sprintf("bundle-diff-files\x00%d\x00%s\x00%s\x00%s\x00%s\x00%d\x00%s\x00%d\x00%t",
+		revision, server, version, bundlePath, action, limit, cursor.Path, cursor.Size, cursor.Set)
+	if body, ok := h.getCached(cacheKey); ok {
+		writeBrowseJSON(w, r, body)
+		return
+	}
+
+	diff, found, err := store.DiffBundleFiles(r.Context(), h.DB, server, version, bundlePath, store.DiffOptions{
+		Action: action,
+		Exts:   exts,
+		Cursor: cursor,
+		Limit:  limit,
+	})
+	if err != nil {
+		http.Error(w, "diff bundle files", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+
+	resp := bundleDiffFilesResponse{
+		Server:       server,
+		AssetVersion: diff.Version.AssetVersion,
+		AppVersion:   diff.Version.AppVersion,
+		BundlePath:   bundlePath,
+		TotalChanged: diff.TotalChanged,
+		Limit:        limit,
+		NextCursor:   encodeDiffCursor(diff.NextCursor),
+		Items:        make([]assetDiffItem, 0, len(diff.Items)),
+	}
+	for _, e := range diff.Items {
+		resp.Items = append(resp.Items, toAssetDiffItem(server, e))
 	}
 
 	body, err := json.Marshal(resp)

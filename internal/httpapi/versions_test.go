@@ -203,3 +203,33 @@ func TestAssetVersionsHandlerRejectsBadInput(t *testing.T) {
 		t.Fatalf("POST status=%d", rr.Code)
 	}
 }
+
+func TestBundleDiffEndpoints(t *testing.T) {
+	db := seedVersionsDB(t)
+	h := newVersionsHandler(db)
+
+	var bResp bundleDiffsResponse
+	rr := getJSON(t, h, "/api/assets/bundle-diffs?server=jp&version=v1", &bResp)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if bResp.Server != "jp" || bResp.AssetVersion != "v1" || bResp.TotalBundles != 2 || len(bResp.Items) != 2 {
+		t.Fatalf("bad bundle diff response: %+v", bResp)
+	}
+	if bResp.Items[0].BundlePath != "img" || bResp.Items[0].FilesURL == "" {
+		t.Fatalf("bad item 0: %+v", bResp.Items[0])
+	}
+
+	var fResp bundleDiffFilesResponse
+	rr = getJSON(t, h, "/api/assets/bundle-diff-files?server=jp&version=v1&path=img", &fResp)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if fResp.Server != "jp" || fResp.AssetVersion != "v1" || fResp.BundlePath != "img" || fResp.TotalChanged != 1 || len(fResp.Items) != 1 {
+		t.Fatalf("bad bundle diff files response: %+v", fResp)
+	}
+	if fResp.Items[0].Path != "img/a.webp" {
+		t.Fatalf("unexpected file in bundle: %+v", fResp.Items[0])
+	}
+}
+

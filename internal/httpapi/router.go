@@ -44,6 +44,8 @@ func (r *Router) Handler() http.Handler {
 	if r.Versions != nil {
 		mux.Handle("/api/assets/versions", r.Versions)
 		mux.Handle("/api/assets/diff", r.Versions)
+		mux.Handle("/api/assets/bundle-diffs", r.Versions)
+		mux.Handle("/api/assets/bundle-diff-files", r.Versions)
 	}
 
 	proxy := r.Proxy

@@ -262,3 +262,264 @@ func extSuffixCondition(exts []string, minMp3Size int64) (string, []any) {
 	return " AND (" + strings.Join(parts, " OR ") + ")", args
 }
 
+// BundleDiffEntry is one bundle added or updated in a version commit.
+type BundleDiffEntry struct {
+	BundlePath  string
+	Fingerprint string
+	Source      string
+	FileCount   int64
+	TotalSize   int64
+}
+
+// VersionBundleDiff represents one page of a version's bundle update diff.
+type VersionBundleDiff struct {
+	Version      Version
+	TotalChanged int64
+	Items        []BundleDiffEntry
+	NextCursor   string
+}
+
+// DiffBundleOptions defines pagination and prefix parameters for DiffVersionBundles.
+type DiffBundleOptions struct {
+	Prefix string
+	Cursor string
+	Limit  int
+}
+
+// VersionBundleFilesDiff is a list of files within a specific bundle changed in a version.
+type VersionBundleFilesDiff struct {
+	Version      Version
+	BundlePath   string
+	TotalChanged int64
+	Items        []DiffEntry
+	NextCursor   DiffCursor
+}
+
+// DiffVersionBundles returns the bundles added/updated by (server, assetVersion),
+// resuming after cursor.
+func DiffVersionBundles(ctx context.Context, db *sql.DB, server, assetVersion string, opts DiffBundleOptions) (VersionBundleDiff, bool, error) {
+	var out VersionBundleDiff
+	if opts.Limit <= 0 {
+		return out, false, nil
+	}
+
+	row := db.QueryRowContext(ctx, `
+		SELECT id, server, app_version, asset_version, asset_hash, bundle_count, committed_at, stats_json
+		FROM versions
+		WHERE server=? AND asset_version=?
+		ORDER BY id DESC
+		LIMIT 1
+	`, server, assetVersion)
+	v := &out.Version
+	err := row.Scan(&v.ID, &v.Server, &v.AppVersion, &v.AssetVersion, &v.AssetHash, &v.BundleCount, &v.CommittedAt, &v.StatsJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return out, false, nil
+	}
+	if err != nil {
+		return out, false, err
+	}
+
+	var count int64
+	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM bundle_completions WHERE server=? AND asset_version=?`, server, assetVersion).Scan(&count)
+	hasCompletions := count > 0
+
+	prefixFilter := ""
+	prefixLike := ""
+	if opts.Prefix != "" {
+		prefixFilter = " AND bc.bundle_path LIKE ?"
+		prefixLike = strings.ReplaceAll(strings.ReplaceAll(opts.Prefix, "%", "\\%"), "_", "\\_") + "%"
+	}
+
+	if hasCompletions {
+		countQuery := `SELECT COUNT(*) FROM bundle_completions bc WHERE bc.server=? AND bc.asset_version=?`
+		countArgs := []any{server, assetVersion}
+		if opts.Prefix != "" {
+			countQuery += " AND bc.bundle_path LIKE ?"
+			countArgs = append(countArgs, prefixLike)
+		}
+		if err := db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&out.TotalChanged); err != nil {
+			return out, false, err
+		}
+
+		pageCond := ""
+		pageArgs := []any{server, assetVersion, server, assetVersion}
+		if opts.Prefix != "" {
+			pageArgs = append(pageArgs, prefixLike)
+		}
+		if opts.Cursor != "" {
+			pageCond = ` AND bc.bundle_path > ?`
+			pageArgs = append(pageArgs, opts.Cursor)
+		}
+		pageArgs = append(pageArgs, opts.Limit+1)
+
+		q := `
+			SELECT bc.bundle_path, bc.fingerprint, bc.source,
+			       COALESCE(a.file_count, 0) AS file_count,
+			       COALESCE(a.total_size, 0) AS total_size
+			FROM bundle_completions bc
+			LEFT JOIN (
+				SELECT bundle_path, COUNT(*) AS file_count, SUM(size) AS total_size
+				FROM assets
+				WHERE server=? AND version=? AND bundle_path<>''
+				GROUP BY bundle_path
+			) a ON bc.bundle_path = a.bundle_path
+			WHERE bc.server=? AND bc.asset_version=?` + prefixFilter + pageCond + `
+			ORDER BY bc.bundle_path ASC
+			LIMIT ?
+		`
+		rows, err := db.QueryContext(ctx, q, pageArgs...)
+		if err != nil {
+			return out, false, err
+		}
+		defer rows.Close()
+
+		out.Items = []BundleDiffEntry{}
+		for rows.Next() {
+			var e BundleDiffEntry
+			if err := rows.Scan(&e.BundlePath, &e.Fingerprint, &e.Source, &e.FileCount, &e.TotalSize); err != nil {
+				return out, false, err
+			}
+			out.Items = append(out.Items, e)
+		}
+		if err := rows.Err(); err != nil {
+			return out, false, err
+		}
+	} else {
+		assetPrefixFilter := ""
+		if opts.Prefix != "" {
+			assetPrefixFilter = " AND bundle_path LIKE ?"
+		}
+
+		countQuery := `SELECT COUNT(DISTINCT bundle_path) FROM assets WHERE server=? AND version=? AND bundle_path<>''`
+		countArgs := []any{server, assetVersion}
+		if opts.Prefix != "" {
+			countQuery += assetPrefixFilter
+			countArgs = append(countArgs, prefixLike)
+		}
+		if err := db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&out.TotalChanged); err != nil {
+			return out, false, err
+		}
+
+		pageCond := ""
+		pageArgs := []any{server, assetVersion}
+		if opts.Prefix != "" {
+			pageArgs = append(pageArgs, prefixLike)
+		}
+		if opts.Cursor != "" {
+			pageCond = ` AND bundle_path > ?`
+			pageArgs = append(pageArgs, opts.Cursor)
+		}
+		pageArgs = append(pageArgs, opts.Limit+1)
+
+		q := `
+			SELECT bundle_path, fingerprint, 'uploaded' AS source, COUNT(*) AS file_count, SUM(size) AS total_size
+			FROM assets
+			WHERE server=? AND version=? AND bundle_path<>''` + assetPrefixFilter + pageCond + `
+			GROUP BY bundle_path
+			ORDER BY bundle_path ASC
+			LIMIT ?
+		`
+		rows, err := db.QueryContext(ctx, q, pageArgs...)
+		if err != nil {
+			return out, false, err
+		}
+		defer rows.Close()
+
+		out.Items = []BundleDiffEntry{}
+		for rows.Next() {
+			var e BundleDiffEntry
+			if err := rows.Scan(&e.BundlePath, &e.Fingerprint, &e.Source, &e.FileCount, &e.TotalSize); err != nil {
+				return out, false, err
+			}
+			out.Items = append(out.Items, e)
+		}
+		if err := rows.Err(); err != nil {
+			return out, false, err
+		}
+	}
+
+	if len(out.Items) > opts.Limit {
+		out.Items = out.Items[:opts.Limit]
+		out.NextCursor = out.Items[opts.Limit-1].BundlePath
+	}
+	return out, true, nil
+}
+
+// DiffBundleFiles returns the files added/updated in a single bundle for (server, assetVersion).
+func DiffBundleFiles(ctx context.Context, db *sql.DB, server, assetVersion, bundlePath string, opts DiffOptions) (VersionBundleFilesDiff, bool, error) {
+	var out VersionBundleFilesDiff
+	out.BundlePath = bundlePath
+	if opts.Limit <= 0 {
+		return out, false, nil
+	}
+
+	row := db.QueryRowContext(ctx, `
+		SELECT id, server, app_version, asset_version, asset_hash, bundle_count, committed_at, stats_json
+		FROM versions
+		WHERE server=? AND asset_version=?
+		ORDER BY id DESC
+		LIMIT 1
+	`, server, assetVersion)
+	v := &out.Version
+	err := row.Scan(&v.ID, &v.Server, &v.AppVersion, &v.AssetVersion, &v.AssetHash, &v.BundleCount, &v.CommittedAt, &v.StatsJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return out, false, nil
+	}
+	if err != nil {
+		return out, false, err
+	}
+
+	actCond := actionCondition(opts.Action)
+	extCond, extArgs := extSuffixCondition(opts.Exts, opts.MinMp3Size)
+
+	countArgs := append([]any{server, assetVersion, bundlePath}, extArgs...)
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM assets a
+		WHERE a.server=? AND a.version=? AND a.bundle_path=? AND a.path<>''`+actCond+extCond,
+		countArgs...).Scan(&out.TotalChanged); err != nil {
+		return out, false, err
+	}
+
+	pageCond := ""
+	pageArgs := append([]any{server, assetVersion, bundlePath}, extArgs...)
+	if opts.Cursor.Set {
+		pageCond = ` AND (a.size<? OR (a.size=? AND a.path>?))`
+		pageArgs = append(pageArgs, opts.Cursor.Size, opts.Cursor.Size, opts.Cursor.Path)
+	}
+	pageArgs = append(pageArgs, opts.Limit+1)
+	rows, err := db.QueryContext(ctx, `
+		SELECT a.path, a.bundle_path, a.fingerprint, a.sha256, a.size, a.is_override,
+		       EXISTS(SELECT 1 FROM assets p WHERE p.server=a.server AND p.path=a.path AND p.id<a.id)
+		FROM assets a
+		WHERE a.server=? AND a.version=? AND a.bundle_path=? AND a.path<>''`+actCond+extCond+pageCond+`
+		ORDER BY a.size DESC, a.path ASC
+		LIMIT ?
+	`, pageArgs...)
+	if err != nil {
+		return out, false, err
+	}
+	defer rows.Close()
+
+	out.Items = []DiffEntry{}
+	for rows.Next() {
+		var e DiffEntry
+		var iso, existed int
+		if err := rows.Scan(&e.Path, &e.BundlePath, &e.Fingerprint, &e.Sha256, &e.Size, &iso, &existed); err != nil {
+			return out, false, err
+		}
+		e.IsOverride = iso == 1
+		e.Existed = existed == 1
+		out.Items = append(out.Items, e)
+	}
+	if err := rows.Err(); err != nil {
+		return out, false, err
+	}
+	if len(out.Items) > opts.Limit {
+		out.Items = out.Items[:opts.Limit]
+		last := out.Items[opts.Limit-1]
+		out.NextCursor = DiffCursor{Size: last.Size, Path: last.Path, Set: true}
+	}
+	return out, true, nil
+}
+
+
