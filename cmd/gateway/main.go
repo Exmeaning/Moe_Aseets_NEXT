@@ -68,7 +68,10 @@ func run() error {
 	}
 	pingCancel()
 
-	indexCtx, indexCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// The read-index meta key changed with the bundle browser: the first boot
+	// after that deploy rebuilds the materialized tables from ~millions of
+	// assets rows, which needs far more than the old 5 minutes on slow disks.
+	indexCtx, indexCancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	indexStart := time.Now()
 	log.Info("read index: ensuring materialized sqlite tables")
 	if err := store.EnsureReadIndexes(indexCtx, db); err != nil {

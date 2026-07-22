@@ -25,7 +25,9 @@ func Open(path string) (*sql.DB, error) {
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Index creation on a populated multi-GB database (e.g. the partial
+	// override-path index) can take well over the old 10s on first boot.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if _, err := db.ExecContext(ctx, Schema); err != nil {
 		_ = db.Close()

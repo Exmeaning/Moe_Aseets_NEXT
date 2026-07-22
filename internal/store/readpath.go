@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -331,9 +330,14 @@ func upsertCurrentSharedAsset(ctx context.Context, tx *sql.Tx, a Asset) error {
 	return err
 }
 
-// BrowseCurrent builds one browser page from SQLite on demand. It avoids the
-// old process-wide browse tree, so memory is proportional to a single request
-// rather than to the full assets table.
+// BrowseCurrent builds one browser page from SQLite on demand. It walks the
+// path-ordered current tables with keyset seeks: each immediate child costs a
+// couple of index probes and a directory's whole subtree is skipped in one
+// jump, so a page touches O(limit·log n) index entries. The previous
+// implementation evaluated `path LIKE 'prefix%'` over every row (LIKE cannot
+// use the BINARY-collated path indexes), which made every request scan the
+// full table — a public crawler paginating the tree turned that into a
+// sustained multi-core burn.
 func BrowseCurrent(ctx context.Context, db *sql.DB, server, prefix, cursor string, limit int) (BrowseResult, error) {
 	if limit <= 0 {
 		return BrowseResult{}, nil
@@ -343,29 +347,77 @@ func BrowseCurrent(ctx context.Context, db *sql.DB, server, prefix, cursor strin
 		return BrowseResult{}, err
 	}
 
-	entries := map[string]BrowseEntry{}
-	pattern := likePrefix(prefix)
-	if err := scanCurrentSharedForBrowse(ctx, db, pattern, func(a Asset) {
-		addBrowseAsset(entries, prefix, &a, true)
-	}); err != nil {
-		return BrowseResult{}, err
-	}
-	if err := scanCurrentOverridesForBrowse(ctx, db, server, pattern, func(a Asset) {
-		addBrowseAsset(entries, prefix, &a, false)
-	}); err != nil {
-		return BrowseResult{}, err
-	}
-
-	items := make([]BrowseEntry, 0, len(entries))
-	for _, entry := range entries {
-		if cursor != "" && entry.Path <= cursor {
-			continue
+	// bound is the inclusive lower key for the next seek. A directory cursor
+	// resumes after its whole subtree; a file cursor resumes just after the
+	// exact key (paths cannot contain NUL, so path+"\x00" is safe).
+	bound := prefix
+	if cursor != "" {
+		if strings.HasSuffix(cursor, "/") {
+			bound = nextAfterSubtree(cursor)
+		} else {
+			bound = cursor + "\x00"
 		}
-		items = append(items, entry)
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return browseLess(items[i], items[j])
-	})
+	upper := nextAfterPrefix(prefix)
+
+	items := make([]BrowseEntry, 0, limit+1)
+	var nextShared, nextOverride *Asset
+	sharedDone, overrideDone := false, false
+	for len(items) < limit+1 {
+		if nextShared == nil && !sharedDone {
+			if nextShared, err = seekCurrentShared(ctx, db, bound, upper); err != nil {
+				return BrowseResult{}, err
+			}
+			sharedDone = nextShared == nil
+		}
+		if nextOverride == nil && !overrideDone {
+			if nextOverride, err = seekCurrentOverride(ctx, db, server, bound, upper); err != nil {
+				return BrowseResult{}, err
+			}
+			overrideDone = nextOverride == nil
+		}
+
+		pick, fromShared := nextShared, true
+		if pick == nil || (nextOverride != nil && nextOverride.Path <= pick.Path) {
+			// Same path in both tables → the override placement wins,
+			// matching the read-path policy.
+			pick, fromShared = nextOverride, false
+		}
+		if pick == nil {
+			break
+		}
+
+		rest := strings.TrimPrefix(pick.Path, prefix)
+		if name, _, nested := strings.Cut(rest, "/"); nested {
+			dirPath := prefix + name + "/"
+			items = append(items, BrowseEntry{
+				Kind: BrowseKindDirectory,
+				Name: name,
+				Path: dirPath,
+			})
+			bound = nextAfterSubtree(dirPath)
+		} else {
+			items = append(items, BrowseEntry{
+				Kind:        BrowseKindAsset,
+				Name:        rest,
+				Path:        pick.Path,
+				Fingerprint: pick.Fingerprint,
+				Sha256:      pick.Sha256,
+				Version:     pick.Version,
+				Size:        pick.Size,
+				FromShared:  fromShared,
+			})
+			bound = pick.Path + "\x00"
+		}
+		// Drop cached seek rows the new bound has moved past; anything still
+		// ahead of it stays valid and saves a probe on the next iteration.
+		if nextShared != nil && nextShared.Path < bound {
+			nextShared = nil
+		}
+		if nextOverride != nil && nextOverride.Path < bound {
+			nextOverride = nil
+		}
+	}
 
 	result := BrowseResult{Items: items, Revision: revision}
 	if len(result.Items) > limit {
@@ -375,32 +427,68 @@ func BrowseCurrent(ctx context.Context, db *sql.DB, server, prefix, cursor strin
 	return result, nil
 }
 
-func scanCurrentSharedForBrowse(ctx context.Context, db *sql.DB, pattern string, fn func(Asset)) error {
-	rows, err := db.QueryContext(ctx, `
+// seekCurrentShared returns the first shared row with path >= bound (and
+// < upper when upper is non-empty), or nil when the range is exhausted.
+func seekCurrentShared(ctx context.Context, db *sql.DB, bound, upper string) (*Asset, error) {
+	query := `
 		SELECT '' AS server, path, version, fingerprint, sha256, size, 0 AS is_override, storage_key, updated_at
 		FROM current_shared_assets
-		WHERE path LIKE ? ESCAPE '\'
-		ORDER BY path ASC
-	`, pattern)
-	if err != nil {
-		return err
+		WHERE path >= ?`
+	args := []any{bound}
+	if upper != "" {
+		query += ` AND path < ?`
+		args = append(args, upper)
 	}
-	defer rows.Close()
-	return scanBrowseRows(rows, fn)
+	query += ` ORDER BY path ASC LIMIT 1`
+	a, ok, err := scanCurrentAssetRow(db.QueryRowContext(ctx, query, args...))
+	if err != nil || !ok {
+		return nil, err
+	}
+	return a, nil
 }
 
-func scanCurrentOverridesForBrowse(ctx context.Context, db *sql.DB, server, pattern string, fn func(Asset)) error {
-	rows, err := db.QueryContext(ctx, `
+// seekCurrentOverride is seekCurrentShared for one server's override rows.
+// Served by the partial index idx_current_assets_override_path.
+func seekCurrentOverride(ctx context.Context, db *sql.DB, server, bound, upper string) (*Asset, error) {
+	query := `
 		SELECT server, path, version, fingerprint, sha256, size, is_override, storage_key, updated_at
 		FROM current_assets
-		WHERE server=? AND is_override=1 AND path LIKE ? ESCAPE '\'
-		ORDER BY path ASC
-	`, server, pattern)
-	if err != nil {
-		return err
+		WHERE server=? AND is_override=1 AND path >= ?`
+	args := []any{server, bound}
+	if upper != "" {
+		query += ` AND path < ?`
+		args = append(args, upper)
 	}
-	defer rows.Close()
-	return scanBrowseRows(rows, fn)
+	query += ` ORDER BY path ASC LIMIT 1`
+	a, ok, err := scanCurrentAssetRow(db.QueryRowContext(ctx, query, args...))
+	if err != nil || !ok {
+		return nil, err
+	}
+	return a, nil
+}
+
+// nextAfterPrefix returns the smallest string greater than every key that
+// starts with prefix, or "" when unbounded (empty prefix).
+func nextAfterPrefix(prefix string) string {
+	b := []byte(prefix)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] < 0xFF {
+			b[i]++
+			return string(b[:i+1])
+		}
+	}
+	return ""
+}
+
+// nextAfterSubtree returns the inclusive seek key just past a directory's
+// subtree: every key under "dir/" is < nextAfterPrefix("dir/").
+func nextAfterSubtree(dirPath string) string {
+	if next := nextAfterPrefix(dirPath); next != "" {
+		return next
+	}
+	// Unreachable for canonical dir paths (they end in '/'), but fall back to
+	// an impossible high key rather than restarting from the top.
+	return dirPath + "\xff"
 }
 
 func scanBrowseRows(rows *sql.Rows, fn func(Asset)) error {
@@ -414,51 +502,4 @@ func scanBrowseRows(rows *sql.Rows, fn func(Asset)) error {
 		fn(a)
 	}
 	return rows.Err()
-}
-
-func addBrowseAsset(entries map[string]BrowseEntry, prefix string, a *Asset, fromShared bool) {
-	if a.Path == "" || !strings.HasPrefix(a.Path, prefix) {
-		return
-	}
-	rest := strings.TrimPrefix(a.Path, prefix)
-	if rest == "" {
-		return
-	}
-	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
-		name := rest[:slash]
-		if name == "" {
-			return
-		}
-		path := prefix + name + "/"
-		entries[BrowseKindDirectory+"\x00"+path] = BrowseEntry{
-			Kind: BrowseKindDirectory,
-			Name: name,
-			Path: path,
-		}
-		return
-	}
-
-	entry := BrowseEntry{
-		Kind:        BrowseKindAsset,
-		Name:        rest,
-		Path:        a.Path,
-		Fingerprint: a.Fingerprint,
-		Sha256:      a.Sha256,
-		Version:     a.Version,
-		Size:        a.Size,
-		FromShared:  fromShared,
-	}
-	entries[BrowseKindAsset+"\x00"+entry.Path] = entry
-}
-
-func browseLess(a, b BrowseEntry) bool {
-	if a.Path != b.Path {
-		return a.Path < b.Path
-	}
-	return a.Kind < b.Kind
-}
-
-func likePrefix(prefix string) string {
-	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return replacer.Replace(prefix) + "%"
 }

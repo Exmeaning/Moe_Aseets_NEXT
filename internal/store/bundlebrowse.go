@@ -107,24 +107,30 @@ func BrowseBundles(ctx context.Context, db *sql.DB, server, prefix, cursor strin
 	}
 
 	entries := map[string]BundleBrowseEntry{}
-	pattern := likePrefix(prefix)
-	if err := scanBundleRows(ctx, db, `
+	upper := nextAfterPrefix(prefix)
+	sharedQuery := `
 		SELECT bundle_path, fingerprint, file_count, total_size, updated_at
 		FROM current_shared_bundles
-		WHERE bundle_path LIKE ? ESCAPE '\'
-		ORDER BY bundle_path ASC
-	`, []any{pattern}, func(e BundleBrowseEntry) {
+		WHERE bundle_path >= ?`
+	sharedArgs := []any{prefix}
+	overrideQuery := `
+		SELECT bundle_path, fingerprint, file_count, total_size, updated_at
+		FROM current_override_bundles
+		WHERE server=? AND bundle_path >= ?`
+	overrideArgs := []any{server, prefix}
+	if upper != "" {
+		sharedQuery += ` AND bundle_path < ?`
+		sharedArgs = append(sharedArgs, upper)
+		overrideQuery += ` AND bundle_path < ?`
+		overrideArgs = append(overrideArgs, upper)
+	}
+	if err := scanBundleRows(ctx, db, sharedQuery+` ORDER BY bundle_path ASC`, sharedArgs, func(e BundleBrowseEntry) {
 		e.FromShared = true
 		addBundleBrowseEntry(entries, prefix, e)
 	}); err != nil {
 		return BundleBrowseResult{}, err
 	}
-	if err := scanBundleRows(ctx, db, `
-		SELECT bundle_path, fingerprint, file_count, total_size, updated_at
-		FROM current_override_bundles
-		WHERE server=? AND bundle_path LIKE ? ESCAPE '\'
-		ORDER BY bundle_path ASC
-	`, []any{server, pattern}, func(e BundleBrowseEntry) {
+	if err := scanBundleRows(ctx, db, overrideQuery+` ORDER BY bundle_path ASC`, overrideArgs, func(e BundleBrowseEntry) {
 		e.FromShared = false
 		addBundleBrowseEntry(entries, prefix, e)
 	}); err != nil {

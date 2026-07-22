@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS current_assets (
 );
 CREATE INDEX IF NOT EXISTS idx_current_assets_path
     ON current_assets(path);
+CREATE INDEX IF NOT EXISTS idx_current_assets_override_path
+    ON current_assets(server, path) WHERE is_override=1;
 
 CREATE TABLE IF NOT EXISTS current_shared_assets (
     path        TEXT PRIMARY KEY,
