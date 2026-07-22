@@ -11,10 +11,12 @@ type serverKey struct{}
 type relPathKey struct{}
 
 // Router wires the routes: /healthz, /metrics, /api/assets/browse,
-// /api/assets/versions, /api/assets/diff, /sekai-{server}-assets/*.
+// /api/assets/bundles, /api/assets/bundle-files, /api/assets/versions,
+// /api/assets/diff, /sekai-{server}-assets/*.
 type Router struct {
 	Proxy    *ProxyHandler
 	Browser  *AssetBrowserHandler
+	Bundles  *AssetBundlesHandler
 	Versions *AssetVersionsHandler
 	Metrics  http.Handler // optional
 	Limiter  *IPRateLimiter
@@ -34,6 +36,10 @@ func (r *Router) Handler() http.Handler {
 	}
 	if r.Browser != nil {
 		mux.Handle("/api/assets/browse", r.Browser)
+	}
+	if r.Bundles != nil {
+		mux.Handle("/api/assets/bundles", r.Bundles)
+		mux.Handle("/api/assets/bundle-files", r.Bundles)
 	}
 	if r.Versions != nil {
 		mux.Handle("/api/assets/versions", r.Versions)

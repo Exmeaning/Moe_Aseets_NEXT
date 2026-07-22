@@ -174,6 +174,108 @@ Operational constraints:
 
 ---
 
+## HTTP API: bundle browser
+
+The bundle-oriented alternative to `/api/assets/browse`: the tree is truncated
+at the bundle level, and a bundle's contents are fetched with a second call.
+The frontend flow is: list a directory of bundles, then follow a bundle's
+`filesUrl`.
+
+```bash
+curl 'http://localhost:8080/api/assets/bundles?server=jp&prefix=event&limit=100'
+curl 'http://localhost:8080/api/assets/bundle-files?server=jp&path=event%2Ffoo'
+```
+
+### `GET /api/assets/bundles`
+
+Query parameters are identical to `/api/assets/browse` (`server`, `prefix`,
+`limit`, `cursor`). Leaves are bundles instead of files:
+
+```json
+{
+  "server": "jp",
+  "prefix": "event/",
+  "limit": 100,
+  "snapshotRevision": 12,
+  "items": [
+    {
+      "type": "directory",
+      "name": "event_frontlines_2026",
+      "path": "event/event_frontlines_2026/"
+    },
+    {
+      "type": "bundle",
+      "name": "screen",
+      "path": "event/screen",
+      "fingerprint": "123456789",
+      "fileCount": 12,
+      "totalSize": 3456789,
+      "source": "shared",
+      "filesUrl": "/api/assets/bundle-files?server=jp&path=event%2Fscreen"
+    }
+  ]
+}
+```
+
+`source` is `override` when the requested server currently overrides that
+bundle; the bundle metadata then describes the override placement.
+
+### `GET /api/assets/bundle-files`
+
+| Name | Required | Default | Notes |
+|---|---:|---|---|
+| `server` | yes | - | One of the configured server tokens. |
+| `path` | yes | - | A bundle path from the bundles endpoint. Unknown → `404`. |
+| `limit` | no | `100` | Page size, capped at `200`. |
+| `cursor` | no | - | Opaque file-path cursor from `nextCursor`. URL-encode it. |
+
+```json
+{
+  "server": "jp",
+  "bundle": {
+    "path": "event/screen",
+    "fingerprint": "123456789",
+    "fileCount": 12,
+    "totalSize": 3456789,
+    "source": "shared"
+  },
+  "limit": 100,
+  "snapshotRevision": 12,
+  "items": [
+    {
+      "type": "asset",
+      "name": "bg.webp",
+      "path": "event/screen/bg.webp",
+      "url": "/sekai-jp-assets/event/screen/bg.webp",
+      "source": "shared",
+      "size": 152341,
+      "fingerprint": "123456789",
+      "sha256": "abcdef...",
+      "version": "6.0.0.1"
+    }
+  ]
+}
+```
+
+Operational constraints:
+
+- Both endpoints read the materialized `current_shared_bundles` /
+  `current_override_bundles` SQLite tables, which are maintained inside the
+  same COMMIT transaction as the per-file current tables — a bundle listing
+  page never scans per-file rows, so it is strictly cheaper than the file
+  browser for the same prefix.
+- Bundle file listings are a single indexed range over one bundle's rows.
+  Shared baseline and the server's overrides are merged per path with the
+  override winning, exactly like the file browser.
+- Pagination, the 200-item cap, the 15-second in-process cache, and
+  `Cache-Control: public, max-age=30, stale-while-revalidate=60` all match
+  `/api/assets/browse`.
+- On first boot after upgrading, the gateway performs one full
+  `EnsureReadIndexes` rebuild to backfill `bundle_path` on the current tables
+  and populate the bundle tables (the read-index meta key changed).
+
+---
+
 ## HTTP API: version history & update diff
 
 `GET /api/assets/versions` lists the committed asset versions of one region,

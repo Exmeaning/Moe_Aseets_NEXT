@@ -31,5 +31,37 @@ func Open(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	// Pre-existing databases created before the bundle browser lack the
+	// bundle_path column on the materialized current tables. Backfill happens
+	// via EnsureReadIndexes (its meta key changed, forcing one full rebuild).
+	for _, m := range []struct{ table, column string }{
+		{"current_assets", "bundle_path"},
+		{"current_shared_assets", "bundle_path"},
+	} {
+		if err := ensureColumn(ctx, db, m.table, m.column,
+			fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT ''", m.table, m.column)); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate %s.%s: %w", m.table, m.column, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, SchemaPostMigrate); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate indexes: %w", err)
+	}
 	return db, nil
+}
+
+// ensureColumn adds a column via ddl when table does not have it yet.
+func ensureColumn(ctx context.Context, db *sql.DB, table, column, ddl string) error {
+	var n int
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, table, column).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, ddl)
+	return err
 }

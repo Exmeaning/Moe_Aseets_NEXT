@@ -206,9 +206,11 @@ func InsertAsset(ctx context.Context, tx *sql.Tx, a Asset) error {
 		return err
 	}
 	if !a.IsOverride {
-		return upsertCurrentSharedAsset(ctx, tx, a)
+		if err := upsertCurrentSharedAsset(ctx, tx, a); err != nil {
+			return err
+		}
 	}
-	return nil
+	return refreshBundleAggregates(ctx, tx, a)
 }
 
 // ReusableAssetBySHA returns a committed asset with the same content hash.

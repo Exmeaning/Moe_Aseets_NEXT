@@ -24,6 +24,7 @@ CREATE INDEX IF NOT EXISTS idx_assets_server_version ON assets(server, version, 
 
 CREATE TABLE IF NOT EXISTS current_assets (
     server      TEXT NOT NULL,
+    bundle_path TEXT NOT NULL DEFAULT '',
     path        TEXT NOT NULL,
     version     TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
@@ -39,12 +40,31 @@ CREATE INDEX IF NOT EXISTS idx_current_assets_path
 
 CREATE TABLE IF NOT EXISTS current_shared_assets (
     path        TEXT PRIMARY KEY,
+    bundle_path TEXT NOT NULL DEFAULT '',
     version     TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
     sha256      TEXT NOT NULL,
     size        INTEGER NOT NULL,
     storage_key TEXT NOT NULL,
     updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS current_shared_bundles (
+    bundle_path TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    file_count  INTEGER NOT NULL,
+    total_size  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS current_override_bundles (
+    server      TEXT NOT NULL,
+    bundle_path TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    file_count  INTEGER NOT NULL,
+    total_size  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY(server, bundle_path)
 );
 
 CREATE TABLE IF NOT EXISTS read_index_meta (
@@ -82,4 +102,14 @@ CREATE INDEX IF NOT EXISTS idx_bundle_completions_bundle_fp
     ON bundle_completions(bundle_path, fingerprint);
 CREATE INDEX IF NOT EXISTS idx_bundle_completions_version
     ON bundle_completions(version_id);
+`
+
+// SchemaPostMigrate holds index DDL that references columns added by the
+// column migrations in Open(). It must run after ensureColumn, because on a
+// pre-existing database the columns do not exist until then.
+const SchemaPostMigrate = `
+CREATE INDEX IF NOT EXISTS idx_current_assets_bundle
+    ON current_assets(server, is_override, bundle_path);
+CREATE INDEX IF NOT EXISTS idx_current_shared_assets_bundle
+    ON current_shared_assets(bundle_path);
 `

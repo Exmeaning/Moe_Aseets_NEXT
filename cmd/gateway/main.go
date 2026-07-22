@@ -115,6 +115,10 @@ func run() error {
 		DB:             db,
 		AllowedServers: cfg.AllowedServers,
 	}
+	bundles := &httpapi.AssetBundlesHandler{
+		DB:             db,
+		AllowedServers: cfg.AllowedServers,
+	}
 	versions := &httpapi.AssetVersionsHandler{
 		DB:             db,
 		AllowedServers: cfg.AllowedServers,
@@ -122,6 +126,7 @@ func run() error {
 	router := &httpapi.Router{
 		Proxy:    proxy,
 		Browser:  browser,
+		Bundles:  bundles,
 		Versions: versions,
 		Metrics:  reg.Handler(),
 		Limiter:  httpapi.NewIPRateLimiter(cfg.HTTPRateLimitRPS, cfg.HTTPRateLimitBurst),

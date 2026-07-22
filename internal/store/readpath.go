@@ -12,7 +12,10 @@ import (
 const (
 	BrowseKindDirectory = "directory"
 	BrowseKindAsset     = "asset"
-	readIndexMaxAssetID = "current_assets_max_id"
+	BrowseKindBundle    = "bundle"
+	// The "_v2" suffix forces one full EnsureReadIndexes rebuild on databases
+	// created before the bundle browser (backfills bundle_path + bundle tables).
+	readIndexMaxAssetID = "current_assets_max_id_v2"
 )
 
 // Placement is the current read-path resolution for one public asset path.
@@ -185,9 +188,17 @@ func EnsureReadIndexes(ctx context.Context, db *sql.DB) error {
 		rollback()
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM current_shared_bundles`); err != nil {
+		rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM current_override_bundles`); err != nil {
+		rollback()
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO current_assets(server, path, version, fingerprint, sha256, size, is_override, storage_key, updated_at)
-		SELECT a.server, a.path, a.version, a.fingerprint, a.sha256, a.size, a.is_override, a.storage_key, a.created_at
+		INSERT INTO current_assets(server, bundle_path, path, version, fingerprint, sha256, size, is_override, storage_key, updated_at)
+		SELECT a.server, a.bundle_path, a.path, a.version, a.fingerprint, a.sha256, a.size, a.is_override, a.storage_key, a.created_at
 		FROM assets a
 		JOIN (
 			SELECT server, path, MAX(id) AS mid
@@ -199,8 +210,8 @@ func EnsureReadIndexes(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO current_shared_assets(path, version, fingerprint, sha256, size, storage_key, updated_at)
-		SELECT a.path, a.version, a.fingerprint, a.sha256, a.size, a.storage_key, a.created_at
+		INSERT INTO current_shared_assets(path, bundle_path, version, fingerprint, sha256, size, storage_key, updated_at)
+		SELECT a.path, a.bundle_path, a.version, a.fingerprint, a.sha256, a.size, a.storage_key, a.created_at
 		FROM assets a
 		JOIN (
 			SELECT path, MAX(id) AS mid
@@ -208,6 +219,33 @@ func EnsureReadIndexes(ctx context.Context, db *sql.DB) error {
 			WHERE is_override=0
 			GROUP BY path
 		) m ON a.id = m.mid
+	`); err != nil {
+		rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO current_shared_bundles(bundle_path, fingerprint, file_count, total_size, updated_at)
+		SELECT c.bundle_path,
+			(SELECT c2.fingerprint FROM current_shared_assets c2
+				WHERE c2.bundle_path=c.bundle_path ORDER BY c2.updated_at DESC, c2.path ASC LIMIT 1),
+			COUNT(*), SUM(c.size), MAX(c.updated_at)
+		FROM current_shared_assets c
+		WHERE c.bundle_path<>''
+		GROUP BY c.bundle_path
+	`); err != nil {
+		rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO current_override_bundles(server, bundle_path, fingerprint, file_count, total_size, updated_at)
+		SELECT c.server, c.bundle_path,
+			(SELECT c2.fingerprint FROM current_assets c2
+				WHERE c2.server=c.server AND c2.bundle_path=c.bundle_path AND c2.is_override=1
+				ORDER BY c2.updated_at DESC, c2.path ASC LIMIT 1),
+			COUNT(*), SUM(c.size), MAX(c.updated_at)
+		FROM current_assets c
+		WHERE c.is_override=1 AND c.bundle_path<>''
+		GROUP BY c.server, c.bundle_path
 	`); err != nil {
 		rollback()
 		return err
@@ -262,9 +300,10 @@ func MarkReadIndexCurrent(ctx context.Context, tx *sql.Tx) error {
 
 func upsertCurrentAsset(ctx context.Context, tx *sql.Tx, a Asset, iso int) error {
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO current_assets(server, path, version, fingerprint, sha256, size, is_override, storage_key, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO current_assets(server, bundle_path, path, version, fingerprint, sha256, size, is_override, storage_key, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(server, path) DO UPDATE SET
+			bundle_path=excluded.bundle_path,
 			version=excluded.version,
 			fingerprint=excluded.fingerprint,
 			sha256=excluded.sha256,
@@ -272,22 +311,23 @@ func upsertCurrentAsset(ctx context.Context, tx *sql.Tx, a Asset, iso int) error
 			is_override=excluded.is_override,
 			storage_key=excluded.storage_key,
 			updated_at=excluded.updated_at
-	`, a.Server, a.Path, a.Version, a.Fingerprint, a.Sha256, a.Size, iso, a.StorageKey, a.CreatedAt)
+	`, a.Server, a.BundlePath, a.Path, a.Version, a.Fingerprint, a.Sha256, a.Size, iso, a.StorageKey, a.CreatedAt)
 	return err
 }
 
 func upsertCurrentSharedAsset(ctx context.Context, tx *sql.Tx, a Asset) error {
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO current_shared_assets(path, version, fingerprint, sha256, size, storage_key, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO current_shared_assets(path, bundle_path, version, fingerprint, sha256, size, storage_key, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
+			bundle_path=excluded.bundle_path,
 			version=excluded.version,
 			fingerprint=excluded.fingerprint,
 			sha256=excluded.sha256,
 			size=excluded.size,
 			storage_key=excluded.storage_key,
 			updated_at=excluded.updated_at
-	`, a.Path, a.Version, a.Fingerprint, a.Sha256, a.Size, a.StorageKey, a.CreatedAt)
+	`, a.Path, a.BundlePath, a.Version, a.Fingerprint, a.Sha256, a.Size, a.StorageKey, a.CreatedAt)
 	return err
 }
 
